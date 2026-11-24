@@ -1,0 +1,6 @@
+# Recorded run: the pipeline with the last live Claude review and judge replies. No API key needed.
+cases: cases.yml
+checks: judge_checks:checks
+agent: agent:recorded_agent
+gate: gate.yml
+runs: 3

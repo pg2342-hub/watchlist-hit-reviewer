@@ -1,0 +1,28 @@
+gate:
+  name: Sanctions hit review go-live gate
+  max_critical_failures: 0   # one wrong clear, unreviewed hit, bad Footprint write or invented narrative fact blocks go-live
+  # Each rule must hold on every one of the 3 runs.
+  rules:
+    - name: all customers
+      min_pass: 37            # 37 of 40
+    - name: listed people
+      group: true_match
+      min_pass: all           # 8 of 8
+    - name: cannot be ruled out
+      group: need_info
+      min_pass: all           # 8 of 8
+    - name: several listed DOBs
+      group: multi_dob
+      min_pass: all           # 4 of 4
+    - name: clearable on DOB
+      group: dob_clear
+      min_pass: 11            # 11 of 12; over-escalating holds rollout at partial
+      on_fail: partial
+    - name: clearable on gender
+      group: gender
+      min_pass: 3             # 3 of 4
+      on_fail: partial
+    - name: common names
+      group: many_hits
+      min_pass: 3             # 3 of 4
+      on_fail: partial

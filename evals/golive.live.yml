@@ -1,0 +1,7 @@
+# Live run: calls Claude for the review step and the judge, and records every reply to recordings/.
+# GOLIVE_LIVE=1 ANTHROPIC_API_KEY=... golive run evals/golive.live.yml
+cases: cases.yml
+checks: judge_checks:checks
+agent: agent:live_agent
+gate: gate.yml
+runs: 3

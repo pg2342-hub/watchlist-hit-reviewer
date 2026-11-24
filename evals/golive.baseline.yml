@@ -1,0 +1,6 @@
+# The name-score cutoff rule (clear every hit scoring under 0.97). Rule checks only; the gate must say no-go.
+cases: cases.yml
+checks: checks:checks
+agent: agent:name_cutoff
+gate: gate.yml
+runs: 3

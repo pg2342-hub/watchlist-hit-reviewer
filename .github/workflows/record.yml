@@ -1,0 +1,46 @@
+name: Record a live run
+
+# Calls Claude for every customer (review step and judge), saves the replies to recordings/,
+# and commits them. Needs the ANTHROPIC_API_KEY secret.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GOLIVE_LIVE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Live run (3 runs of 40 customers, Claude review + Claude judge)
+        run: |
+          test -n "$ANTHROPIC_API_KEY" || { echo "Set the ANTHROPIC_API_KEY repo secret first"; exit 1; }
+          rm -f recordings/reviewer.jsonl recordings/judge.jsonl
+          set +e
+          golive run evals/golive.live.yml --out reports/live
+          code=$?
+          set -e
+          cat reports/live/report.md >> "$GITHUB_STEP_SUMMARY"
+          # 0 go, 1 no-go, 2 partial are all results worth keeping; 3 is a config error
+          test "$code" -ne 3
+          # keep only a complete recording: 120 review calls (40 customers x 3 runs)
+          test "$(wc -l < recordings/reviewer.jsonl)" -eq 120 || { echo "incomplete recording, not committing"; exit 1; }
+      - name: Rebuild the demo page from the recording
+        # replay only: with GOLIVE_LIVE unset the judge replays the recording instead of grading again
+        run: |
+          if [ -f scripts/build_demo.py ]; then env -u GOLIVE_LIVE python scripts/build_demo.py; fi
+      - name: Commit the recording
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add recordings docs
+          git commit -m "Record live run" || echo "nothing to commit"
+          git push

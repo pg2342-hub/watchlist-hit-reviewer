@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "watchlist-backtest-gate"
+version = "0.1.0"
+description = "Backtest an AI reviewer's sanctions-hit calls against analysts' past calls, and gate go-live"
+requires-python = ">=3.10"
+dependencies = [
+  "golive-gate[claude]==0.1.1",
+  "pyyaml>=6",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools]
+packages = ["watchlist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E402"]
+
+[tool.ruff.lint.per-file-ignores]
+"watchlist/reviewer.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["watchlist"]
+known-third-party = ["golive_gate"]

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check .
+      - run: pytest -q
+      - name: The name-score cutoff rule must be blocked (no-go)
+        run: |
+          set +e
+          golive run evals/golive.baseline.yml --out reports/baseline
+          test $? -eq 1
+
+  gate:
+    # Grades the pipeline against the last recorded live Claude run. Fails the build on no-go.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+      - name: Go-live gate on the recorded run
+        if: hashFiles('recordings/reviewer.jsonl') != ''
+        run: |
+          set +e
+          golive run evals/golive.yml --out reports/recorded
+          code=$?
+          cat reports/recorded/report.md >> "$GITHUB_STEP_SUMMARY"
+          test "$code" -eq 0
+      - if: hashFiles('recordings/reviewer.jsonl') == ''
+        run: echo "No recorded live run yet; run the 'Record a live run' workflow."
