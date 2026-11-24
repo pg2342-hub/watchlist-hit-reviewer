@@ -39,6 +39,26 @@ def confirm(customer: dict, uid: str) -> dict:
     }
 
 
+def code_note(customer: dict, hit: dict, facts: dict, proposed: dict) -> dict:
+    """The note code writes when the review came back without one: what it can establish, and what to check."""
+    dob = customer_dob(customer)
+    listed = "; ".join(facts["listed_dobs"]) or "none"
+    if not dob:
+        dob_part = f"The customer has no DOB on file; the entry lists DOB {listed}."
+    else:
+        dob_part = f"The customer's DOB {dob} against listed DOB {listed}: {', '.join(facts['dob_results']) or 'no listed DOB'}."
+    note = (
+        f"Escalated by code. Claude proposed {proposed['call']} ({proposed['kind']}) on hit {hit['uid']} but returned no "
+        f"deciding fact or note, so code did not act on it. {dob_part}"
+    )
+    step = (
+        f"Confirm the customer's DOB {dob} on a government ID and compare it with each listed DOB ({listed}), then close the hit."
+        if dob
+        else f"Obtain a government ID showing full date of birth and compare it with each listed DOB ({listed})."
+    )
+    return {"narrative": note, "deciding_fact": dob_part, "next_step": step}
+
+
 def guard(proposed: dict, facts: dict) -> tuple[str, str, str | None]:
     """Final (call, kind, guardrail note) for one hit."""
     if facts["dob_exact_match"]:
@@ -83,8 +103,7 @@ def run(case_input: dict, review: Callable[[dict], dict], footprint: FakeFootpri
         elif not str(r.get("narrative") or "").strip() or not str(r.get("deciding_fact") or "").strip():
             proposed = {"call": r["call"], "kind": r["kind"]}
             final = ("escalate", "need_info", "the reviewer gave no deciding fact or note, so nothing can be cleared on it")
-            r = {**r, "narrative": "Escalated by code: the review came back without a deciding fact or note.", "deciding_fact": ""}
-            r["next_step"] = r.get("next_step") or "Review this hit by hand against the list entry."
+            r = {**r, **code_note(customer, h, facts, proposed)}
         else:
             proposed = {"call": r["call"], "kind": r["kind"]}
             final = guard(proposed, facts)

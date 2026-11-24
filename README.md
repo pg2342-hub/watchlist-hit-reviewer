@@ -1,58 +1,63 @@
-# watchlist-backtest-gate
+# watchlist-hit-reviewer
 
-[![CI](https://github.com/pg2342-hub/watchlist-backtest-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/pg2342-hub/watchlist-backtest-gate/actions/workflows/ci.yml)
+[![CI](https://github.com/pg2342-hub/watchlist-hit-reviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/pg2342-hub/watchlist-hit-reviewer/actions/workflows/ci.yml)
 
-Demo page: https://pranavgudise.dev/watchlist-backtest-gate/ (every customer, hit, call and narrative from the latest recorded live run; no install needed)
+Demo page: https://pranavgudise.dev/watchlist-hit-reviewer/ (pick any of 40 customers and follow the agent through every Footprint call; no install needed)
 
-A backtest and go-live gate for an AI reviewer of sanctions screening hits. Constructed customers are screened against the **real OFAC SDN list**. Claude reviews every hit under a written procedure, proposes clear or escalate, and writes the case narrative. Code confirms the deciding fact before any clear is posted to Footprint. The gate then compares every call with the call an analyst already made on that case: **go, partial or no-go**, and a single wrong clear blocks go-live.
-
-Built on [golive-gate](https://github.com/pg2342-hub/golive-gate).
+An agent for KYC teams on Footprint. When an onboarding lands in manual review with an OFAC watchlist hit, it reads the risk signals, decrypts only the fields the review needs, has Claude compare each hit with the customer under a written procedure, and posts a pass only when code confirms the hit is not the customer. Everything else stays in manual review, with a case brief for the analyst. It never posts a fail.
 
 {{LATEST_RUN}}
 
-## Why a backtest comes first
+## What it does, step by step
 
-Most sanctions name hits are not the listed person, so a reviewer that agrees with analysts most of the time can look ready long before it is. The question a bank asks before it lets anything clear a hit is narrower: on our own past cases, did it ever clear someone our analyst escalated? The list makes that harder than it looks. One listed person can carry several dates of birth, a year-only date, a "circa" year or a range, and the same person can onboard under another spelling or an alias.
+1. **Receive.** `python -m watchlist.server` takes Footprint's `footprint.onboarding.completed` webhook, checks its Svix signature, answers 202 and queues the work. Events without `requires_manual_review` are ignored.
+2. **Read.** `GET /users/{fp_id}/onboardings/{onboarding_id}/risk_signals`. No `watchlist_hit_ofac` signal, nothing to do.
+3. **Decrypt, scoped.** `POST /users/{fp_id}/vault/decrypt` for name, DOB, nationality, address and the ID document's DOB and gender, with a reason Footprint logs. No SSN, email or phone.
+4. **Review.** Candidate entries come from the real OFAC SDN list. Claude (`claude-opus-5-5`, structured output) compares DOB, gender, nationality, place of birth and aliases for every hit and proposes clear or escalate, with the deciding fact, an audit note and, for an escalation, the next thing to obtain.
+5. **Guard.** Code decides what may be written. A clear stands only if code confirms its deciding fact (the customer's DOB differs from every listed DOB, or both genders are on file and differ). A listed full DOB equal to the customer's always escalates. A hit with no review, or a review with no note, escalates.
+6. **Write.** `POST /users/{fp_id}/decisions` with `status: pass` and the notes as the annotation, only when every hit is cleared. Otherwise the review stays open and the analyst gets the brief.
 
-## What is in it
+## Backtest before it touches a queue
 
-| Part | File |
-|---|---|
-| The OFAC SDN list (SDN, ALT and ADD CSV files), fetched from the Treasury Sanctions List Service by this repo's own workflow, with a manifest of sizes and hashes | `scripts/fetch_sdn.py`, `data/ofac/` |
-| Parsing the list's free-text remarks into every listed DOB (full date, month, year, circa, range), place of birth, nationality, citizenship and gender | `watchlist/sdn.py` |
-| The screener: each customer name against every listed individual and alias, token-order independent, accents and titles stripped, Jaro-Winkler per token | `watchlist/names.py`, `watchlist/screen.py` |
-| 40 historical reviews in six groups: listed people (by name, by another spelling, by alias), same name born years apart, same name and the other gender, records that cannot rule the listed person out, listed people with several DOBs, and common names with several hits. Each hit carries the analyst's call | `scripts/make_cases.py` → `evals/cases.yml` |
-| The review procedure the agent is given and the analysts followed | `procedures/sanctions_review_sop.md` |
-| The Claude review step: one call per customer, structured output, a proposed call, the attributes compared with both values, the deciding fact, a narrative and a next step for every hit | `watchlist/reviewer.py` |
-| Guardrails in code: a clear stands only when code confirms its deciding fact; a listed full DOB equal to the customer's always escalates; a hit with no review escalates; Footprint gets a pass decision only when every hit is cleared, and never a fail | `watchlist/pipeline.py` |
-| The Footprint side: risk signals (`watchlist_hit_ofac`) and the manual decision request (`POST /users/{fp_id}/decisions`, `status` pass or fail plus `annotation`), validated against Footprint's public API reference | `watchlist/footprint.py` |
-| 6 rule checks (3 critical) and 2 Claude judge checks (narratives grounded in the evidence, critical; escalations say what to obtain) | `evals/checks.py`, `evals/judge_checks.py` |
-| The gate, on each of 3 runs: zero critical failures, 37 of 40 customers, every listed person, every record that cannot be ruled out, every multi-DOB case; over-escalating clearable hits holds rollout at partial | `evals/gate.yml` |
-| A name-score cutoff rule the gate must block | `watchlist/baseline.py` |
+Before a bank lets anything clear a hit, it wants one answer: on our own past cases, did it ever clear someone our analyst escalated? The repo answers that with 40 past reviews built on real SDN entries (listed people under their own name, another spelling and an alias; namesakes born years apart; the other gender; records that cannot rule the person out; people with several listed DOBs; common names with several hits), each with the analyst's call. [golive-gate](https://github.com/pg2342-hub/golive-gate) runs the same agent 3 times on all 40 and holds go-live unless there are zero wrong clears, 37 of 40 customers pass, and every listed person is escalated. A name-score cutoff rule runs on the same cases as the shortcut it must beat.
 
 ## Footprint
 
-Footprint's sandbox needs an approved account, so this repo does not call Footprint. The two requests it makes follow Footprint's public API reference (read November 24, 2026): `GET /users/{fp_id}/onboardings/{onboarding_id}/risk_signals` and `POST /users/{fp_id}/decisions`. `FakeFootprint` validates and records every request so the checks can grade them; `FootprintClient` sends the same requests when `FOOTPRINT_API_KEY` is set, and is untested against the live API.
+Footprint's sandbox needs company approval, so this repo does not call Footprint. `FootprintClient` sends the requests in Footprint's public API reference (read November 24, 2026), authenticated with `X-Footprint-Secret-Key`. Tests and the demo run it over HTTP against `watchlist/sandbox.py`, a stand-in that answers in the same shapes and rejects what Footprint would reject (no key, a decrypt without a reason or for an unknown field, a decision body with extra fields). The document field names (`document.passport.dob` and similar) should be confirmed on an account.
+
+To point it at Footprint:
+
+```
+FOOTPRINT_API_KEY=sk_test_... FOOTPRINT_WEBHOOK_SECRET=whsec_... ANTHROPIC_API_KEY=... \
+  python -m watchlist.server --port 8000 --out cases/
+```
+
+then register `https://<host>/webhooks/footprint` in the Footprint dashboard.
+
+## Files
+
+| Part | File |
+|---|---|
+| The agent: one webhook in, one reviewed customer out, plus the analyst brief | `watchlist/agent.py` |
+| Webhook receiver and Svix signature check | `watchlist/server.py`, `watchlist/svix.py` |
+| Footprint client and request validation | `watchlist/footprint.py` |
+| Footprint stand-in for tests and the demo | `watchlist/sandbox.py` |
+| Claude review step (prompt, schema, one retry on an empty note) | `watchlist/reviewer.py`, `procedures/sanctions_review_sop.md` |
+| Guardrails and the decision write | `watchlist/pipeline.py` |
+| OFAC SDN snapshot, fetched by this repo's own workflow, and its parser | `scripts/fetch_sdn.py`, `data/ofac/`, `watchlist/sdn.py` |
+| Name screen (token-order independent, accents and titles stripped, Jaro-Winkler per token) | `watchlist/names.py`, `watchlist/screen.py` |
+| 40 past reviews, checks (6 rule, 2 Claude judge), gate | `scripts/make_cases.py`, `evals/` |
 
 ## Run it
 
 ```
 pip install -e ".[dev]"
-pytest -q                                      # tests, no network or key
-golive run evals/golive.baseline.yml           # name-score cutoff: NO-GO
-golive run evals/golive.yml                    # replays the recorded Claude run: no key needed
-GOLIVE_LIVE=1 ANTHROPIC_API_KEY=... golive run evals/golive.live.yml   # a fresh live run, recorded to recordings/
-python scripts/fetch_sdn.py                    # refresh the SDN snapshot
-python scripts/make_cases.py                   # rebuild the 40 cases from the snapshot
-python scripts/build_demo.py                   # rebuild the demo page
+pytest -q                               # tests, no network or key
+python scripts/build_demo.py            # runs the agent on all 40 customers and both gates, writes docs/
+golive run evals/golive.yml             # the backtest, replaying the recorded Claude run: no key needed
+golive run evals/golive.baseline.yml    # the name-score cutoff: NO-GO
 ```
 
-## How the live run is recorded
-
-The review step and the judge call Claude (`claude-opus-5-5`, low effort). A live run writes every reply to `recordings/`, with cost and latency per call. CI and the demo page replay those replies through the current code (screening, guardrails and the Footprint writes always run for real), so they need no API key and give the same result every time. A recording made with a different prompt, schema or model does not replay. The **Record a live run** workflow (Actions tab, needs the `ANTHROPIC_API_KEY` secret) refreshes the recording and the demo page.
-
-## CI
-
-Every push runs ruff, the tests on Python 3.10 and 3.12, the cutoff rule (which must come out no-go), and the gate on the recorded run, which fails the build on no-go and writes the report to the job summary.
+The review step and the judge call Claude only in the **Record a live run** workflow (Actions tab, needs the `ANTHROPIC_API_KEY` secret), which writes every reply with its cost and latency to `recordings/`. CI and the demo replay those replies through the current code, so screening, guardrails and every Footprint request always run for real, with no key. A recording made with a different prompt, schema or model does not replay.
 
 List entries are real public data from OFAC. Customers, their records, the analysts' calls and the review procedure are constructed; no data here belongs to any bank or customer.

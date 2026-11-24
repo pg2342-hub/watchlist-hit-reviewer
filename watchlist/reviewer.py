@@ -114,8 +114,7 @@ class ClaudeReviewer:
         self.model = model
         self.effort = effort
 
-    def __call__(self, v: dict) -> dict:
-        start = time.perf_counter()
+    def _ask(self, messages: list[dict]) -> tuple[dict, str, Any]:
         response = self.client.beta.messages.create(
             model=self.model,
             max_tokens=16000,
@@ -123,31 +122,49 @@ class ClaudeReviewer:
             fallbacks="default",
             output_config={"effort": self.effort, "format": {"type": "json_schema", "schema": SCHEMA}},
             system=SYSTEM,
-            messages=[{"role": "user", "content": prompt(v)}],
+            messages=messages,
         )
-        latency = time.perf_counter() - start
         if response.stop_reason == "refusal":
             raise RuntimeError("the model declined this review")
         if response.stop_reason == "max_tokens":
             raise RuntimeError("the review was cut off at max_tokens")
         text = next(b.text for b in response.content if b.type == "text")
-        out = json.loads(text)
-        if incomplete(out) and not getattr(self, "_retrying", False):
-            # an empty note is not a review; ask once more, then let the pipeline escalate whatever is still empty
-            self._retrying = True
-            try:
-                again = self(v)
-            finally:
-                self._retrying = False
-            again["_meta"]["retried"] = True
-            return again
+        return json.loads(text), text, response
+
+    def __call__(self, v: dict) -> dict:
+        start = time.perf_counter()
+        messages = [{"role": "user", "content": prompt(v)}]
+        out, text, response = self._ask(messages)
+        cost, tokens_in, tokens_out = self.cost(response), response.usage.input_tokens, response.usage.output_tokens
+        retried = False
+        if incomplete(out):
+            # an empty note is not a review: say which fields are empty and ask once more; whatever is still
+            # empty is escalated by the pipeline
+            missing = sorted({r["uid"] for r in out.get("reviews", []) if incomplete({"reviews": [r]})})
+            messages += [
+                {"role": "assistant", "content": text},
+                {
+                    "role": "user",
+                    "content": f"The review for hit(s) {', '.join(missing)} left deciding_fact, narrative or next_step empty. "
+                    "Return the full output again with every field filled as the rules say.",
+                },
+            ]
+            out2, _, response2 = self._ask(messages)
+            retried = True
+            cost += self.cost(response2)
+            tokens_in += response2.usage.input_tokens
+            tokens_out += response2.usage.output_tokens
+            if not incomplete(out2) or len(out2.get("reviews", [])) >= len(out.get("reviews", [])):
+                out = out2
         out["_meta"] = {
             "model": getattr(response, "model", self.model),
-            "latency_s": round(latency, 3),
-            "cost_usd": round(self.cost(response), 6),
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
+            "latency_s": round(time.perf_counter() - start, 3),
+            "cost_usd": round(cost, 6),
+            "input_tokens": tokens_in,
+            "output_tokens": tokens_out,
         }
+        if retried:
+            out["_meta"]["retried"] = True
         return out
 
     def cost(self, response: Any) -> float:

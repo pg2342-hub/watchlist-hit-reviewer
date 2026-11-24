@@ -155,9 +155,9 @@ def main() -> None:
   <div class="compose">
     <div class="lab" id="pick-l">Pick a customer</div>
     <div class="seg" role="radiogroup" aria-label="Filter customers by outcome">
-      <button type="button" role="radio" aria-checked="true" data-f="all">All <span>40</span></button>
-      <button type="button" role="radio" aria-checked="false" data-f="posted_pass">Pass posted <span>{posted}</span></button>
-      <button type="button" role="radio" aria-checked="false" data-f="sent_to_analyst">To analyst <span>{40 - posted}</span></button>
+      <button type="button" role="radio" aria-checked="true" data-f="all">All&nbsp; <span>40</span></button>
+      <button type="button" role="radio" aria-checked="false" data-f="posted_pass">Pass posted&nbsp; <span>{posted}</span></button>
+      <button type="button" role="radio" aria-checked="false" data-f="sent_to_analyst">To analyst&nbsp; <span>{40 - posted}</span></button>
     </div>
     <div class="plist" id="plist" role="listbox" aria-labelledby="pick-l"></div>
   </div>
@@ -340,7 +340,7 @@ function list(){
   el.querySelectorAll('.pi').forEach(b=>b.addEventListener('click',()=>show(b.dataset.id)));
 }
 function kv(r){
-  const ev=Object.entries(r.event).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(JSON.stringify(v))}</dd>`).join('');
+  const ev=Object.entries(r.event).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(typeof v==='string'?v:JSON.stringify(v))}</dd>`).join('');
   const dec=r.trace.find(t=>t.path.endsWith('/vault/decrypt'));
   const f=dec?Object.entries(dec.resp).map(([k,v])=>`<dt>${esc(k)}</dt><dd${v==null?' class="nul"':''}>${v==null?'null':esc(v)}</dd>`).join(''):'';
   document.getElementById('kv').innerHTML=ev+'<div class="gap"></div>'+f;

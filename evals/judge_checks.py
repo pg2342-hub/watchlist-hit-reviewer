@@ -43,7 +43,7 @@ def _narratives(out):
         guard = f" Guardrail changed the proposed call: {h['guardrail']}." if h.get("guardrail") else ""
         rows.append(
             f"Hit {h['uid']} on name {h['matched_name']!r} (name score {h['name_score']}).\n"
-            f"List entry: {json.dumps(h['list_entry'], sort_keys=True)}\n"
+            f"List entry (OFAC SDN list): {json.dumps(h['list_entry'], sort_keys=True)}\n"
             f"Reviewer proposed: {proposed['call']} ({proposed['kind']}). Final call: {final['call']} ({final['kind']}).{guard}\n"
             f"Deciding fact: {h['deciding_fact']}\nNarrative: {h['narrative']}\nNext step: {h['next_step']}"
         )
@@ -57,8 +57,9 @@ _grounded = judge_check(
     "Every narrative uses only facts that appear in the customer record or that hit's list entry (no invented dates, "
     "places, documents or conclusions), states the reviewer's proposed call correctly, and names the fact the call rests on. "
     "The narrative is written before any guardrail runs, so a final call that differs from the narrative is fine when a "
-    "guardrail note explains it. A narrative that contradicts the proposed call, or quotes a value that is not in the "
-    "evidence, fails.",
+    "guardrail note explains it. A note that says code escalated the hit because the review came back empty passes "
+    "when it states that and quotes only values from the evidence. A narrative that contradicts the proposed call, "
+    "or quotes a value that is not in the evidence, fails.",
     judge=judge,
     render_case=_evidence,
     render_output=_narratives,
