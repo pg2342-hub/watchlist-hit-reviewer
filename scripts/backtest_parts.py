@@ -269,7 +269,7 @@ def main() -> None:
 
 <section class="verdict" aria-labelledby="verdict-h">
   <div class="vhead"><h2 id="verdict-h">Same 40 customers, same gate</h2><p>Gate: <b>zero</b> wrong clears or critical errors, <b>37 of 40</b> customers, every listed person, on all 3 runs</p></div>
-  {vrow("Claude reviewer", f"{escape(model)}, low effort, code guardrails on every clear", rec)}
+  {vrow("Claude reviewer", f"{escape(model)}, medium effort, code guardrails on every clear", rec)}
   {vrow("Name-score cutoff", "Clears every hit whose name score is under 0.97", base)}
   <div class="legend"><span><i class="pass"></i>Passed</span><span><i class="fail"></i>Failed</span><span><i class="crit"></i>Critical error</span><span>Each square is one customer over 3 runs. Select one to read it.</span></div>
 </section>

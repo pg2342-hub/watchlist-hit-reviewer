@@ -25,6 +25,7 @@ import yaml  # noqa: E402
 
 from watchlist import agent  # noqa: E402
 from watchlist.footprint import FootprintClient  # noqa: E402
+from watchlist.reviewer import EFFORT  # noqa: E402
 from watchlist.sandbox import Sandbox  # noqa: E402
 from watchlist.svix import sign, verify  # noqa: E402
 
@@ -124,7 +125,28 @@ def main() -> None:
     manifest = json.loads((ROOT / "data/ofac/manifest.json").read_text())
     outcomes = bt.hit_outcomes(rec, cases)
     n_hits = len(outcomes)
-    false_clear = sum(1 for r in outcomes if bt.outcome(r) == "false_clear")
+    per_run = []
+    for i in range(3):
+        hits = [(h, cases[c["id"]]["expected"]["calls"][h["uid"]]) for c in rec["cases"] for h in c["runs"][i]["output"]["hits"]]
+        per_run.append(
+            (
+                sum(h["final"]["call"] == w["call"] for h, w in hits),
+                sum(h["final"]["call"] == "clear" and w["call"] == "escalate" for h, w in hits),
+            )
+        )
+    agreed_min = min(a for a, _ in per_run)
+    false_clear_all = sum(f for _, f in per_run)
+    crit = sum(r["critical"] for r in rec["summary"]["by_run"])
+    vague = sorted({c["id"] for c in rec["cases"] for r in c["runs"] if "escalations_actionable" in r["failed_checks"]})
+    if rec["decision"] == "go":
+        gate_line = "The gate passes."
+    elif crit == 0 and vague:
+        gate_line = (
+            f"The gate still holds it at {rec['decision'].upper()}, on wording alone: on {len(vague)} escalations the next step "
+            "left for the analyst was too vague to act on, and every listed person's case must pass every check."
+        )
+    else:
+        gate_line = f"The gate holds it at {rec['decision'].upper()}."
     blocked = sum(1 for r in outcomes if bt.outcome(r) == "blocked")
     posted = sum(1 for r in rows if r["action"] == "posted_pass")
     metas = [r["meta"] for r in rows if r["meta"].get("latency_s")]
@@ -187,10 +209,10 @@ def main() -> None:
 
 <section id="backtest">
   <h2>Backtest before it touches a queue</h2>
-  <p class="point">The same agent ran on 40 past reviews, 3 times each, and every call was compared with the analyst's. It agreed with the analyst on hits it cleared, with <b>{false_clear}</b> wrong clears across {n_hits} hits on run 1, and posted a pass for <b>{posted} of 40</b> customers. A name-score cutoff, the obvious shortcut, cleared <b>{base_fc}</b> listed people who onboarded under another spelling.</p>
+  <p class="point">The same agent ran on 40 past reviews, 3 times each, and every call was compared with the analyst's. It made the analyst's call on <b>{agreed_min} of {n_hits}</b> hits on every run, with <b>{false_clear_all}</b> wrong clears over the 3 runs, and posted a pass for <b>{posted} of 40</b> customers. {escape(gate_line)} A name-score cutoff, the obvious shortcut, cleared <b>{base_fc}</b> listed people who onboarded under another spelling.</p>
   <div class="verdict" aria-labelledby="verdict-h">
     <div class="vhead"><h2 id="verdict-h">Same 40 customers, same gate</h2><p>Gate: <b>zero</b> wrong clears or critical errors, <b>37 of 40</b> customers, every listed person, on all 3 runs</p></div>
-    {bt.vrow("This agent", f"{escape(model)}, low effort, code guardrails on every clear", rec)}
+    {bt.vrow("This agent", f"{escape(model)}, {EFFORT} effort, code guardrails on every clear", rec)}
     {bt.vrow("Name-score cutoff", "Clears every hit whose name score is under 0.97", base)}
     <div class="legend"><span><i class="pass"></i>Passed</span><span><i class="fail"></i>Failed</span><span><i class="crit"></i>Critical error</span><span>Each square is one customer over 3 runs. Select one to open it above.</span></div>
   </div>

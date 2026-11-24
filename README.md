@@ -6,7 +6,7 @@ Demo page: https://pranavgudise.dev/watchlist-hit-reviewer/ (pick any of 40 cust
 
 An agent for KYC teams on Footprint. When an onboarding lands in manual review with an OFAC watchlist hit, it reads the risk signals, decrypts only the fields the review needs, has Claude compare each hit with the customer under a written procedure, and posts a pass only when code confirms the hit is not the customer. Everything else stays in manual review, with a case brief for the analyst. It never posts a fail.
 
-{{LATEST_RUN}}
+**Latest recorded live run (November 24, 2026, `claude-opus-5-5`, medium effort, 40 customers x 3 runs):** the agent made the analyst's call on **59 of 59 hits on every run**, with **zero wrong clears**, and posted a pass for **22 of 40** customers, every one of them a customer the analyst had cleared. The gate is still **NO-GO**, on wording alone: on 2 escalations the next step left for the analyst was too vague to act on, and the gate requires every listed person's case to pass every check. A name-score cutoff cleared 2 listed people who onboarded under another spelling (NO-GO with critical errors). Mean $0.035 and 9.6 s per customer for the review; the judge cost $1.63 for all 3 runs.
 
 ## What it does, step by step
 
