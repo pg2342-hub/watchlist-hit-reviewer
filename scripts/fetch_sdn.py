@@ -21,7 +21,7 @@ def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
     manifest = {"source": BASE, "fetched_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "files": {}}
     for name in FILES:
-        req = urllib.request.Request(BASE + name, headers={"User-Agent": "watchlist-backtest-gate"})
+        req = urllib.request.Request(BASE + name, headers={"User-Agent": "watchlist-hit-reviewer"})
         with urllib.request.urlopen(req, timeout=120) as r:
             body = r.read()
         if len(body) < 10_000:

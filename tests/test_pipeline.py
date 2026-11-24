@@ -65,6 +65,57 @@ def test_missing_review_is_escalated():
     assert out["footprint_requests"] == []
 
 
+def test_clear_without_a_note_is_escalated():
+    case = next(c for c in CASES if c["group"] == "dob_clear")
+
+    def silent(v):
+        r = review(v)
+        for x in r["reviews"]:
+            x["narrative"], x["deciding_fact"] = "", ""
+        return r
+
+    out = run(case, silent)
+    assert all(h["final"] == {"call": "escalate", "kind": "need_info"} and h["narrative"] for h in out["hits"])
+    assert out["footprint_requests"] == []
+
+
+def test_reviewer_retries_once_on_an_empty_note():
+    from watchlist.reviewer import ClaudeReviewer, incomplete
+
+    replies = [
+        {
+            "reviews": [
+                {"uid": "1", "call": "clear", "kind": "dob", "comparisons": [], "deciding_fact": "", "narrative": "", "next_step": None}
+            ]
+        },
+        {
+            "reviews": [
+                {"uid": "1", "call": "clear", "kind": "dob", "comparisons": [], "deciding_fact": "x", "narrative": "y", "next_step": None}
+            ]
+        },
+    ]
+
+    class Msg:
+        def __init__(self, body):
+            self.content = [type("B", (), {"type": "text", "text": json.dumps(body)})()]
+            self.stop_reason = "end_turn"
+            self.model = "claude-opus-5-5"
+            self.usage = type("U", (), {"input_tokens": 10, "output_tokens": 10})()
+
+    class Client:
+        calls = 0
+
+        class beta:  # noqa: N801
+            class messages:  # noqa: N801
+                @staticmethod
+                def create(**kw):
+                    Client.calls += 1
+                    return Msg(replies[Client.calls - 1])
+
+    out = ClaudeReviewer(client=Client)({"fp_id": "f", "customer": {}, "hits": []})
+    assert Client.calls == 2 and not incomplete(out) and out["_meta"]["retried"]
+
+
 def test_pass_posted_only_when_all_clear():
     for case in CASES:
         out = run(case)

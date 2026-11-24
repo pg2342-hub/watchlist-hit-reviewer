@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 MODEL = "claude-opus-5-5"
-EFFORT = "low"
+EFFORT = "medium"
 # USD per million tokens (input, output), first-party list prices.
 PRICES = {"claude-opus-5-5": (4.00, 20.00), "claude-opus-4-8": (5.00, 25.00), "claude-sonnet-5-5": (2.00, 10.00)}
 
@@ -32,11 +32,10 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["uid", "call", "kind", "comparisons", "deciding_fact", "narrative", "next_step"],
+                # reasoning fields first, so the call is written after the comparison and the note
+                "required": ["uid", "comparisons", "deciding_fact", "narrative", "call", "kind", "next_step"],
                 "properties": {
                     "uid": {"type": "string"},
-                    "call": {"type": "string", "enum": ["clear", "escalate"]},
-                    "kind": {"type": "string", "enum": ["dob", "gender", "likely_match", "need_info"]},
                     "comparisons": {
                         "type": "array",
                         "items": {
@@ -56,6 +55,8 @@ SCHEMA = {
                     },
                     "deciding_fact": {"type": "string"},
                     "narrative": {"type": "string"},
+                    "call": {"type": "string", "enum": ["clear", "escalate"]},
+                    "kind": {"type": "string", "enum": ["dob", "gender", "likely_match", "need_info"]},
                     "next_step": _nullable,
                 },
             },
@@ -70,9 +71,10 @@ SYSTEM = f"""You are a sanctions screening reviewer at a bank. Screening has rai
 Rules for your output:
 - One review per hit, with the hit's uid. kind is dob or gender for a clear, likely_match or need_info for an escalation.
 - comparisons: the attributes you compared. Copy customer_value and list_value exactly as they appear in the record (dates as written there); use null when the value is not on file. List every listed DOB you compared, one comparison each.
-- deciding_fact: the one fact the call rests on, in one sentence.
-- narrative: three to five sentences for the audit file, using only facts in the record.
-- next_step: for an escalation, what the next reviewer must obtain or check; null for a clear.
+- deciding_fact: the one fact the call rests on, in one sentence. Never empty.
+- narrative: three to five sentences for the audit file, using only facts in the record. Never empty. State the call you are proposing and why.
+- next_step: for an escalation, the specific document or attribute the next reviewer must obtain or check (for example a government ID showing full date of birth, or place of birth to compare with the listed one), and only one the list entry can be checked against; null for a clear.
+- Dates: a listed DOB given as a year, or a month and year, is not a full DOB, so it can never be a full-DOB match. Compare day, month and year one by one and say exactly which parts differ.
 When the record does not let you rule the listed person out, escalate. A wrong clear lets a sanctioned person open an account; an unneeded escalation costs an analyst a few minutes."""
 
 
@@ -89,6 +91,15 @@ def view(case_input: dict, hits: list[dict]) -> dict:
 
 def prompt(v: dict) -> str:
     return "Customer record and screening hits:\n" + json.dumps(v, indent=1, sort_keys=True)
+
+
+def incomplete(out: dict) -> bool:
+    return any(
+        not str(r.get("narrative") or "").strip()
+        or not str(r.get("deciding_fact") or "").strip()
+        or (r.get("call") == "escalate" and not str(r.get("next_step") or "").strip())
+        for r in out.get("reviews", [])
+    )
 
 
 class ClaudeReviewer:
@@ -121,6 +132,15 @@ class ClaudeReviewer:
             raise RuntimeError("the review was cut off at max_tokens")
         text = next(b.text for b in response.content if b.type == "text")
         out = json.loads(text)
+        if incomplete(out) and not getattr(self, "_retrying", False):
+            # an empty note is not a review; ask once more, then let the pipeline escalate whatever is still empty
+            self._retrying = True
+            try:
+                again = self(v)
+            finally:
+                self._retrying = False
+            again["_meta"]["retried"] = True
+            return again
         out["_meta"] = {
             "model": getattr(response, "model", self.model),
             "latency_s": round(latency, 3),

@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "watchlist-backtest-gate"
+name = "watchlist-hit-reviewer"
 version = "0.1.0"
-description = "Backtest an AI reviewer's sanctions-hit calls against analysts' past calls, and gate go-live"
+description = "An agent that reviews OFAC watchlist hits from Footprint, clears only what code confirms, and sends the rest to an analyst"
 requires-python = ">=3.10"
 dependencies = [
   "golive-gate[claude]==0.1.1",
@@ -33,6 +33,7 @@ ignore = ["E402"]
 [tool.ruff.lint.per-file-ignores]
 "watchlist/reviewer.py" = ["E501"]
 "scripts/build_demo.py" = ["E501"]
+"scripts/backtest_parts.py" = ["E501"]
 "scripts/make_cases.py" = ["E501"]
 
 [tool.ruff.lint.isort]

@@ -5,7 +5,7 @@ Guardrails (code, not the model):
   file and differs from every listed DOB; for a gender clear, both genders are on file and differ and no
   listed DOB matches. Otherwise the hit is escalated as need_info, with the reason kept.
 - A hit whose listed full DOB equals the customer's is always escalated as a likely match.
-- A hit the model did not review is escalated.
+- A hit the model did not review, or reviewed without a deciding fact and note, is escalated.
 - Footprint gets a pass decision only when every hit on the customer is cleared, with the narratives as
   the annotation. Escalations leave the manual review open. Nothing here ever posts a fail.
 """
@@ -80,6 +80,11 @@ def run(case_input: dict, review: Callable[[dict], dict], footprint: FakeFootpri
             proposed = {"call": "escalate", "kind": "need_info"}
             final = ("escalate", "need_info", "the reviewer returned no review for this hit")
             r = {"comparisons": [], "deciding_fact": "", "narrative": "", "next_step": None}
+        elif not str(r.get("narrative") or "").strip() or not str(r.get("deciding_fact") or "").strip():
+            proposed = {"call": r["call"], "kind": r["kind"]}
+            final = ("escalate", "need_info", "the reviewer gave no deciding fact or note, so nothing can be cleared on it")
+            r = {**r, "narrative": "Escalated by code: the review came back without a deciding fact or note.", "deciding_fact": ""}
+            r["next_step"] = r.get("next_step") or "Review this hit by hand against the list entry."
         else:
             proposed = {"call": r["call"], "kind": r["kind"]}
             final = guard(proposed, facts)

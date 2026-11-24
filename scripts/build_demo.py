@@ -1,7 +1,10 @@
-"""Build the GitHub Pages demo (docs/index.html) from the recorded live run and the cutoff rule.
+"""Build the GitHub Pages demo (docs/index.html): the agent working one customer at a time, plus the backtest.
 
-python scripts/build_demo.py              # runs both gates (replay, no API key), then writes the page
-python scripts/build_demo.py --no-run     # reuse reports/recorded and reports/baseline
+python scripts/build_demo.py              # runs the agent on all 40 customers and both gates (replay, no API key)
+python scripts/build_demo.py --no-run     # reuse reports/recorded and reports/baseline for the backtest section
+
+The agent runs for real here: a signed webhook per customer, the Footprint client over HTTP against the
+stand-in (watchlist/sandbox.py), the SDN screen, the recorded Claude review, the guardrails and the writes.
 """
 
 from __future__ import annotations
@@ -10,222 +13,124 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from html import escape
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-REPO = "watchlist-backtest-gate"
-GROUPS = {
-    "true_match": "Listed person",
-    "need_info": "Cannot rule out",
-    "multi_dob": "Several listed DOBs",
-    "dob_clear": "Clear on DOB",
-    "gender": "Clear on gender",
-    "many_hits": "Common name",
-}
-KINDS = {
-    "likely_match": "escalate: likely match",
-    "need_info": "escalate: need more information",
-    "dob": "clear: DOB",
-    "gender": "clear: gender",
-}
+sys.path[:0] = [str(ROOT), str(ROOT / "evals"), str(ROOT / "scripts")]
+
+import backtest_parts as bt  # noqa: E402
+import yaml  # noqa: E402
+
+from watchlist import agent  # noqa: E402
+from watchlist.footprint import FootprintClient  # noqa: E402
+from watchlist.sandbox import Sandbox  # noqa: E402
+from watchlist.svix import sign, verify  # noqa: E402
+
+REPO = bt.REPO
+SECRET = "whsec_ZGVtby13ZWJob29rLXNlY3JldC0wMQ=="  # demo only
 
 
-def run_gates() -> None:
-    for cfg, out in (("evals/golive.yml", "reports/recorded"), ("evals/golive.baseline.yml", "reports/baseline")):
-        subprocess.run(["golive", "run", cfg, "--out", out], cwd=ROOT, check=False, stdout=subprocess.DEVNULL)
+def run_agent(cases: list[dict]) -> list[dict]:
+    from agent import REVIEW_TAPE, fingerprint
 
+    from watchlist.recorded import replay_reviewer
 
-def load(path: str) -> dict:
-    return json.loads((ROOT / path / "results.json").read_text())
-
-
-def state(case: dict) -> tuple[str, str]:
-    """Worst outcome over the runs: critical, failed, or passed on every run."""
-    crit_ids = {c["id"] for c in CHECKS if c["critical"]}
-    st = "pass"
-    for r in case["runs"]:
-        if not r["passed"]:
-            if set(r["failed_checks"]) & crit_ids or r["error"]:
-                return "crit", "failed with a critical error"
-            st = "fail"
-    return st, ("passed on all 3 runs" if st == "pass" else "failed on at least one run")
-
-
-def strip(res: dict, who: str) -> str:
-    cells = []
-    for c in res["cases"]:
-        st, words = state(c)
-        cells.append(f'<a class="cell {st}" href="#case-{c["id"]}" data-case="{c["id"]}" aria-label="{who} {c["id"]} {words}"></a>')
-    return f'<div class="strip" role="group" aria-label="{who}: every customer">{"".join(cells)}</div>'
-
-
-def badge(decision: str) -> str:
-    cls = {"go": "go", "no-go": "nogo", "partial": "part"}[decision]
-    return f'<span class="gate {cls}">{decision.upper()}</span>'
-
-
-def vrow(name: str, sub: str, res: dict) -> str:
-    worst = min(r["passed"] for r in res["summary"]["by_run"])
-    crit = sum(r["critical"] for r in res["summary"]["by_run"])
-    return f"""<div class="vrow">
-  <div class="vwho"><b>{name}</b><span>{sub}</span></div>
-  {strip(res, name)}
-  <div class="vscore"><b>{worst}</b><span>of 40 passed (worst run)<br>{crit} critical over 3 runs</span></div>
-  {badge(res["decision"])}
-</div>"""
-
-
-def hit_outcomes(res: dict, cases: dict) -> list[dict]:
-    """Every hit on run 1: the analyst's call, the reviewer's proposal and the final call."""
+    review = replay_reviewer(REVIEW_TAPE, fingerprint())
     rows = []
-    for c in res["cases"]:
-        out = c["runs"][0]["output"]
-        for h in out["hits"]:
-            want = cases[c["id"]]["expected"]["calls"][h["uid"]]
+    with Sandbox(cases) as sb:
+        for c in cases:
+            i = c["input"]
+            event = {
+                "event_kind": "footprint.onboarding.completed",
+                "fp_id": i["fp_id"],
+                "onboarding_id": i["onboarding_id"],
+                "status": "fail",
+                "requires_manual_review": True,
+                "is_live": False,
+                "playbook_key": "pb_test_kyc",
+            }
+            body = json.dumps(event).encode()
+            ts = int(time.time())
+            verify(
+                SECRET,
+                {"svix-id": f"msg_{c['id']}", "svix-timestamp": str(ts), "svix-signature": sign(SECRET, f"msg_{c['id']}", ts, body)},
+                body,
+            )
+            fp = FootprintClient("sk_test_standin", sb.url)
+            r = agent.handle(event, fp, review)
+            out = r["review"]
+            hits = []
+            for h in out["hits"]:
+                want = c["expected"]["calls"][h["uid"]]
+                e = h["list_entry"]
+                hits.append(
+                    {
+                        "uid": h["uid"],
+                        "name": e["name"],
+                        "score": h["name_score"],
+                        "programs": e["programs"],
+                        "listed": {"dob": e["dob"], "gender": e["gender"], "nationality": e["nationality"], "pob": e["place_of_birth"]},
+                        "proposed": h["proposed"],
+                        "final": h["final"],
+                        "guardrail": h["guardrail"],
+                        "comparisons": h["comparisons"],
+                        "deciding_fact": h["deciding_fact"],
+                        "narrative": h["narrative"],
+                        "next_step": h["next_step"],
+                        "analyst": {"call": want["call"], "kind": want["kind"]},
+                    }
+                )
+            trace = []
+            for t in r["trace"]:
+                body_ = t["body"]
+                resp = None
+                if t["path"].endswith("/risk_signals"):
+                    resp = sb.store.users[i["fp_id"]]["risk_signals"]
+                elif t["path"].endswith("/vault/decrypt"):
+                    vault = sb.store.users[i["fp_id"]]["vault"]
+                    resp = {f: vault.get(f) for f in body_["fields"]}
+                trace.append({"method": t["method"], "path": t["path"], "status": t["status"], "body": body_, "resp": resp})
+            meta = out["_meta"]
             rows.append(
                 {
-                    "case": c["id"],
-                    "uid": h["uid"],
-                    "want": want,
-                    "proposed": h["proposed"],
-                    "final": h["final"],
-                    "guardrail": h["guardrail"],
+                    "id": c["id"],
+                    "group": c["group"],
+                    "title": c["title"],
+                    "name": out["screened_name"],
+                    "event": event,
+                    "action": r["action"],
+                    "hits": hits,
+                    "trace": trace,
+                    "brief": r["brief"],
+                    "meta": {k: meta.get(k) for k in ("model", "latency_s", "cost_usd")},
                 }
             )
     return rows
 
 
-def outcome(h: dict) -> str:
-    if h["final"]["call"] == "clear" and h["want"]["call"] == "escalate":
-        return "false_clear"
-    if h["guardrail"] and h["proposed"]["call"] == "clear":
-        return "blocked"
-    if h["final"]["call"] == h["want"]["call"]:
-        return "agreed"
-    return "over"
-
-
-def flow_svg(rows: list[dict]) -> str:
-    """Signature visual: every hit, grouped by the analyst's call, split by what happened to it. Drawn to scale."""
-    order = ["dob", "gender", "likely_match", "need_info"]
-    labels = {
-        "dob": "Analyst cleared: DOB",
-        "gender": "Analyst cleared: gender",
-        "likely_match": "Analyst escalated: likely match",
-        "need_info": "Analyst escalated: need info",
-    }
-    parts = [
-        ("agreed", "Same call", "var(--green)", ""),
-        ("blocked", "Clear blocked by code", "url(#hatch)", ""),
-        ("over", "Escalated instead", "var(--paper)", "var(--ink)"),
-        ("false_clear", "Wrongly cleared", "var(--ink)", ""),
-    ]
-    unit, x0, bar_h, gap, w = 16, 230, 26, 14, 760
-    total_max = max(sum(1 for r in rows if r["want"]["kind"] == k) for k in order)
-    unit = min(unit, (w - x0 - 40) / max(total_max, 1))
-    y = 10
-    out = [
-        f'<svg class="flow" viewBox="0 0 {w} {len(order) * (bar_h + gap) + 60}" role="img" aria-label="Every screening hit by the analyst call and what the reviewer did">',
-        '<defs><pattern id="hatch" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">'
-        '<rect width="6" height="6" fill="var(--paper)"/><line x1="0" y1="0" x2="0" y2="6" stroke="var(--ink)" stroke-width="2"/></pattern></defs>',
-    ]
-    for k in order:
-        sub = [r for r in rows if r["want"]["kind"] == k]
-        out.append(f'<text x="0" y="{y + bar_h / 2 + 5}" class="fl">{labels[k]}</text>')
-        x = x0
-        for key, _, fill, stroke in parts:
-            n = sum(1 for r in sub if outcome(r) == key)
-            if n:
-                s = f' stroke="{stroke}" stroke-width="1.5"' if stroke else ""
-                out.append(
-                    f'<rect x="{x:.1f}" y="{y}" width="{n * unit - 2:.1f}" height="{bar_h}" rx="4" fill="{fill}"{s}><title>{n} hit(s)</title></rect>'
-                )
-                x += n * unit
-        out.append(f'<text x="{x + 8:.1f}" y="{y + bar_h / 2 + 5}" class="fn">{len(sub)}</text>')
-        y += bar_h + gap
-    lx = 0
-    for _, label, fill, stroke in parts:
-        s = f' stroke="{stroke}" stroke-width="1.5"' if stroke else ""
-        out.append(
-            f'<rect x="{lx}" y="{y + 6}" width="12" height="12" rx="3" fill="{fill}"{s}/><text x="{lx + 18}" y="{y + 16}" class="fk">{label}</text>'
-        )
-        lx += 30 + len(label) * 7.2
-    out.append("</svg>")
-    return "".join(out)
-
-
-def customer_cell(inp: dict) -> str:
-    v, d = inp["customer"]["vault"], inp["customer"]["document"]
-    name = " ".join(x for x in (v["id.first_name"], v.get("id.middle_name"), v["id.last_name"]) if x)
-    dob = v.get("id.dob")
-    bits = [f"DOB {dob}" if dob else "no DOB in the vault"]
-    if d.get("dob") and not dob:
-        bits.append(f"ID document DOB {d['dob']}")
-    if d.get("gender"):
-        bits.append(f"{d['gender'].lower()} on the ID document")
-    if not d:
-        bits.append("no ID document")
-    return f"<b>{escape(name)}</b><div class='ch'>{escape(', '.join(bits))}</div>"
-
-
-def hit_list(case: dict, res_case: dict) -> str:
-    out = res_case["runs"][0]["output"]
-    items = []
-    for h in out["hits"]:
-        want = case["expected"]["calls"][h["uid"]]
-        e = h["list_entry"]
-        mark = "ok" if h["final"]["call"] == want["call"] else "bad"
-        g = f"<div class='why'>Code: {escape(h['guardrail'])}</div>" if h["guardrail"] else ""
-        detail = ""
-        if h.get("narrative"):
-            nxt = f"<p><b>Next step.</b> {escape(h['next_step'])}</p>" if h.get("next_step") else ""
-            detail = f"<details><summary>Narrative</summary><p>{escape(h['narrative'])}</p>{nxt}</details>"
-        items.append(
-            f"<li><span class='n'>SDN {h['uid']}</span> {escape(e['name'])}"
-            f"<div class='ch'>listed DOB {escape('; '.join(e['dob']) or 'none')}{', ' + escape(e['gender'].lower()) if e.get('gender') else ''}"
-            f", name score {h['name_score']:.2f}</div>"
-            f"<div>Analyst: {KINDS[want['kind']]}. <span class='v {mark}'>Reviewer: {KINDS[h['final']['kind']]}</span></div>{g}{detail}</li>"
-        )
-    return f"<ul class='hits'>{''.join(items)}</ul>"
-
-
-def verdict_cell(res_case: dict) -> str:
-    fails = {}
-    for r in res_case["runs"]:
-        for cid in r["failed_checks"]:
-            fails.setdefault(cid, r["verdicts"][cid]["reason"])
-        if r["error"]:
-            fails.setdefault("error", r["error"])
-    if not fails:
-        return "<td class='v ok'>Pass</td>"
-    crit = any(c["critical"] and c["id"] in fails for c in CHECKS)
-    why = "".join(f"<div class='why'>{escape(k)}: {escape(v[:160])}</div>" for k, v in fails.items())
-    return f"<td class='v bad{' crit' if crit else ''}'>Fail{' (critical)' if crit else ''}{why}</td>"
-
-
-CHECKS: list[dict] = []
-
-
 def main() -> None:
-    global CHECKS
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-run", action="store_true")
     args = ap.parse_args()
     if not args.no_run:
-        run_gates()
-    rec, base = load("reports/recorded"), load("reports/baseline")
-    CHECKS = rec["checks"]
-    import yaml
-
-    cases = {c["id"]: c for c in yaml.safe_load((ROOT / "evals/cases.yml").read_text())["cases"]}
+        bt.run_gates()
+    rec, base = bt.load("reports/recorded"), bt.load("reports/baseline")
+    bt.CHECKS = rec["checks"]
+    case_list = yaml.safe_load((ROOT / "evals/cases.yml").read_text())["cases"]
+    cases = {c["id"]: c for c in case_list}
+    rows = run_agent(case_list)
     manifest = json.loads((ROOT / "data/ofac/manifest.json").read_text())
-    rows = hit_outcomes(rec, cases)
-    n_hits = len(rows)
-    blocked = sum(1 for r in rows if outcome(r) == "blocked")
-    false_clear = sum(1 for r in rows if outcome(r) == "false_clear")
-    agreed = sum(1 for r in rows if outcome(r) == "agreed")
-    auto = sum(1 for r in rows if r["final"]["call"] == "clear")
+    outcomes = bt.hit_outcomes(rec, cases)
+    n_hits = len(outcomes)
+    false_clear = sum(1 for r in outcomes if bt.outcome(r) == "false_clear")
+    blocked = sum(1 for r in outcomes if bt.outcome(r) == "blocked")
+    posted = sum(1 for r in rows if r["action"] == "posted_pass")
+    metas = [r["meta"] for r in rows if r["meta"].get("latency_s")]
+    model = metas[0]["model"] if metas else ""
+    mean_cost = sum(m["cost_usd"] for m in metas) / max(len(metas), 1)
+    mean_lat = sum(m["latency_s"] for m in metas) / max(len(metas), 1)
     base_fc = sum(
         1
         for c in base["cases"]
@@ -233,100 +138,90 @@ def main() -> None:
         for h in r["output"]["hits"]
         if h["final"]["call"] == "clear" and cases[c["id"]]["expected"]["calls"][h["uid"]]["call"] == "escalate"
     )
-    meta = [r["output"]["_meta"] for c in rec["cases"] for r in c["runs"] if r["output"]["_meta"].get("latency_s")]
-    model = meta[0].get("model", "") if meta else ""
-    mean_cost = sum(m["cost_usd"] for m in meta) / max(len(meta), 1)
-    mean_lat = sum(m["latency_s"] for m in meta) / max(len(meta), 1)
-    judge_cost = rec["summary"]["total_judge_cost_usd"]
-    gate_reasons = "".join(f"<li>{escape(x)}</li>" for x in rec["gate_result"]["reasons"]) or "<li>Every rule held on all 3 runs.</li>"
-
-    seg = '<button type="button" role="radio" aria-checked="true" data-t="all">All&nbsp; <span>40</span></button>' + "".join(
-        f'<button type="button" role="radio" aria-checked="false" data-t="{g}">{label}&nbsp; <span>{sum(1 for c in cases.values() if c["group"] == g)}</span></button>'
-        for g, label in GROUPS.items()
-    )
-    base_by = {c["id"]: c for c in base["cases"]}
-    trs = []
-    for c in rec["cases"]:
-        case = cases[c["id"]]
-        trs.append(
-            f'<tr id="case-{c["id"]}" data-tier="{case["group"]}"><td class="n">{c["id"]}</td>'
-            f'<td><span class="tag">{GROUPS[case["group"]]}</span><div class="ch">{escape(case["title"])}</div></td>'
-            f"<td class='tx'>{customer_cell(case['input'])}</td><td class='hx'>{hit_list(case, c)}</td>"
-            f"{verdict_cell(c)}{verdict_cell(base_by[c['id']])}</tr>"
-        )
-    SEV = {True: '<span class="sev sev-critical">Critical</span>', False: '<span class="sev">Standard</span>'}
-    check_rows = "".join(
-        f"<tr><td class='n'>{escape(c['id'])}</td><td>{escape(c['text'])}</td><td>{SEV[c['critical']]}</td></tr>" for c in CHECKS
-    )
+    rec_date = time.strftime("%B %-d, %Y", time.gmtime((ROOT / "recordings" / "reviewer.jsonl").stat().st_mtime))
+    start = next((r["id"] for r in rows if r["action"] == "posted_pass" and len(r["hits"]) == 1), rows[0]["id"])
+    data = json.dumps({"rows": rows, "start": start, "model": model, "recorded": rec_date}, separators=(",", ":")).replace("</", "<\\/")
 
     html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Watchlist Backtest Gate</title>
-<meta name="description" content="A backtest and go-live gate for an AI reviewer of OFAC sanctions name hits: Claude with code guardrails is {rec["decision"].upper()} on 40 customers screened against the real SDN list; a name-score cutoff is {base["decision"].upper()}.">
-<style>{CSS}</style></head><body><main>
+<title>Watchlist Hit Reviewer</title>
+<meta name="description" content="An agent that reviews OFAC watchlist hits from Footprint, clears only what code confirms, and sends the rest to an analyst. {posted} of 40 customers cleared with zero wrong clears in the backtest.">
+<style>{bt.CSS}{CSS}</style></head><body><main>
 <div class="head">
-<h1>Watchlist Backtest Gate</h1>
-<p class="lead">A backtest for an AI reviewer of sanctions screening hits. Constructed customers are screened against the real OFAC SDN list, Claude reviews every hit under a written procedure, code confirms the deciding fact before any clear is posted to Footprint, and the gate compares each call with the analyst's past call.</p>
+  <h1>Watchlist Hit Reviewer</h1>
+  <p class="lead">An agent for KYC teams on Footprint. When an onboarding lands in manual review with an OFAC hit, it reads the risk signals, decrypts only the fields the review needs, has Claude compare each hit with the customer under a written procedure, and posts a pass only when code confirms the hit is not the customer. Everything else goes to an analyst with a case brief.</p>
 </div>
 
-<section class="verdict" aria-labelledby="verdict-h">
-  <div class="vhead"><h2 id="verdict-h">Same 40 customers, same gate</h2><p>Gate: <b>zero</b> wrong clears or critical errors, <b>37 of 40</b> customers, every listed person, on all 3 runs</p></div>
-  {vrow("Claude reviewer", f"{escape(model)}, low effort, code guardrails on every clear", rec)}
-  {vrow("Name-score cutoff", "Clears every hit whose name score is under 0.97", base)}
-  <div class="legend"><span><i class="pass"></i>Passed</span><span><i class="fail"></i>Failed</span><span><i class="crit"></i>Critical error</span><span>Each square is one customer over 3 runs. Select one to read it.</span></div>
+<section class="desk" id="tool" aria-label="Review a customer">
+  <div class="compose">
+    <div class="lab" id="pick-l">Pick a customer</div>
+    <div class="seg" role="radiogroup" aria-label="Filter customers by outcome">
+      <button type="button" role="radio" aria-checked="true" data-f="all">All <span>40</span></button>
+      <button type="button" role="radio" aria-checked="false" data-f="posted_pass">Pass posted <span>{posted}</span></button>
+      <button type="button" role="radio" aria-checked="false" data-f="sent_to_analyst">To analyst <span>{40 - posted}</span></button>
+    </div>
+    <div class="plist" id="plist" role="listbox" aria-labelledby="pick-l"></div>
+  </div>
+
+  <article class="doc" id="doc" aria-live="polite"></article>
+
+  <div class="rec" id="rec">
+    <h2>What Footprint sent and what the agent read</h2>
+    <p>The signed webhook, then the vault fields it decrypted with a logged reason. Empty fields come back as null.</p>
+    <dl class="kv" id="kv"></dl>
+  </div>
 </section>
 
 <div class="layout">
 <div class="content">
 
-<h2 id="why">Why a backtest comes first</h2>
-<p class="point">Most sanctions name hits are not the listed person, so a reviewer that agrees with analysts most of the time looks ready long before it is. The question a bank asks is narrower: on our own past cases, did it ever clear someone our analyst escalated? Here the Claude reviewer agreed with the analyst on <b>{agreed} of {n_hits}</b> hits on run 1, with <b>{false_clear}</b> wrong clears, and <b>{auto}</b> hits could post a clear without an analyst. The name-score cutoff cleared <b>{base_fc}</b> listed people who onboarded under another spelling.</p>
-<p class="note">Recorded live run: {escape(model)}, one call per customer, mean ${mean_cost:.4f} and {mean_lat:.1f} s per customer; judge ${judge_cost:.2f} in total for all 3 runs. CI replays the recorded replies through the current code, so it needs no API key.</p>
+<section id="how">
+  <h2>How it works</h2>
+  <p class="point">Footprint flags the name hit; the agent does the analyst's first pass. Claude proposes a call for every hit and writes the reasoning. Code then checks the one fact the call rests on before anything is written back, and the agent can only ever post a pass. A fail, or anything it cannot settle, stays with a person.</p>
+  <div class="steps">
+    <div class="step"><h3><span>1</span>Receive</h3><p><b>A signed webhook.</b> <code>footprint.onboarding.completed</code> with <code>requires_manual_review</code>, checked against its Svix signature. Anything else is ignored.</p></div>
+    <div class="step"><h3><span>2</span>Read</h3><p><b>Risk signals, then a scoped decrypt.</b> It stops unless a signal is <code>watchlist_hit_ofac</code>, then decrypts name, DOB, nationality, address and the ID document's DOB and gender, with a reason Footprint logs. No SSN.</p></div>
+    <div class="step"><h3><span>3</span>Review</h3><p><b>Every hit against the SDN record.</b> Candidate entries come from the OFAC SDN list. Claude compares DOB, gender, nationality and aliases under the written procedure and proposes clear or escalate.</p></div>
+    <div class="step"><h3><span>4</span>Guard and write</h3><p><b>Code confirms, then writes.</b> A clear stands only if code confirms the deciding fact; a listed DOB equal to the customer's always escalates. A pass is posted only when every hit is cleared.</p></div>
+  </div>
+</section>
 
-<h2 id="hits">Where every hit landed</h2>
-<p class="note" style="margin:0 0 16px">All {n_hits} hits on run 1, grouped by the analyst's call. A hatched block is a clear the reviewer proposed and code blocked because it could not confirm the deciding fact.</p>
-{flow_svg(rows)}
-<p class="note">Guardrail blocks on run 1: {blocked}. Code posts a clear only when the customer's DOB differs from every listed DOB, or both genders are on file and differ with no listed DOB matching; a listed full DOB equal to the customer's always escalates.</p>
+<section id="backtest">
+  <h2>Backtest before it touches a queue</h2>
+  <p class="point">The same agent ran on 40 past reviews, 3 times each, and every call was compared with the analyst's. It agreed with the analyst on hits it cleared, with <b>{false_clear}</b> wrong clears across {n_hits} hits on run 1, and posted a pass for <b>{posted} of 40</b> customers. A name-score cutoff, the obvious shortcut, cleared <b>{base_fc}</b> listed people who onboarded under another spelling.</p>
+  <div class="verdict" aria-labelledby="verdict-h">
+    <div class="vhead"><h2 id="verdict-h">Same 40 customers, same gate</h2><p>Gate: <b>zero</b> wrong clears or critical errors, <b>37 of 40</b> customers, every listed person, on all 3 runs</p></div>
+    {bt.vrow("This agent", f"{escape(model)}, low effort, code guardrails on every clear", rec)}
+    {bt.vrow("Name-score cutoff", "Clears every hit whose name score is under 0.97", base)}
+    <div class="legend"><span><i class="pass"></i>Passed</span><span><i class="fail"></i>Failed</span><span><i class="crit"></i>Critical error</span><span>Each square is one customer over 3 runs. Select one to open it above.</span></div>
+  </div>
+  <h3 class="sub">Where every hit landed</h3>
+  <p class="note" style="margin:0 0 12px">All {n_hits} hits on run 1, grouped by the analyst's call. A hatched block is a clear Claude proposed and code blocked ({blocked} on run 1).</p>
+  {bt.flow_svg(outcomes)}
+  <p class="note">Recorded live run, {escape(rec_date)}: {escape(model)}, one call per customer, mean ${mean_cost:.4f} and {mean_lat:.1f} s per customer. CI replays the recorded replies through the current code, so it needs no API key.</p>
+</section>
 
-<h2 id="every-case">Every customer</h2>
-<div class="seg" role="radiogroup" aria-label="Filter by kind of customer">{seg}</div>
-<div class="scroll"><table class="t" id="cases"><thead><tr><th>#</th><th>Kind</th><th>Customer record</th><th>Hits on the SDN list, run 1</th><th>Claude reviewer</th><th>Name cutoff</th></tr></thead><tbody>
-{"".join(trs)}
-</tbody></table></div>
-
-<h2 id="gate">The gate</h2>
-<ul class="note">{gate_reasons}</ul>
-<div class="scroll"><table class="t"><thead><tr><th>Check</th><th>What it asks</th><th>Severity</th></tr></thead><tbody>{check_rows}</tbody></table></div>
+<section id="limits">
+  <h2>Limits</h2>
+  <ul class="lim">
+    <li>Footprint's sandbox needs company approval, so Footprint is not called here. The client sends the requests Footprint's public API reference describes, and a local stand-in answers them in the same shapes. The document field names (<code>document.passport.dob</code> and similar) should be confirmed on an account.</li>
+    <li>Customers and the analysts' past calls are constructed; the list entries are real. A bank's own past reviews would replace the 40 cases before any pilot.</li>
+    <li>Candidate list entries come from this repo's own screen of the SDN list, at the same threshold that raised the hit. Footprint's own match details, where an account exposes them, would replace that step.</li>
+  </ul>
+</section>
 </div>
 
 <aside class="side" aria-label="About this build">
-  <nav aria-label="On this page"><a href="#why">Why a backtest comes first</a><a href="#hits">Where every hit landed</a><a href="#every-case">Every customer</a><a href="#gate">The gate</a></nav>
-  <div><h3>Data</h3><p>List entries are real: the public OFAC SDN list from the U.S. Treasury Sanctions List Service, fetched {escape(manifest["fetched_utc"][:10])} by this repo's own workflow. Customers, their records and the analysts' past calls are constructed, and so is the review procedure. Footprint request shapes follow its public API reference; Footprint is not called.</p></div>
+  <nav aria-label="On this page"><a href="#tool">Review a customer</a><a href="#how">How it works</a><a href="#backtest">Backtest</a><a href="#limits">Limits</a></nav>
+  <div><h3>Data</h3><p>List entries are real: the public OFAC SDN list from the U.S. Treasury Sanctions List Service, fetched {escape(manifest["fetched_utc"][:10])} by this repo's own workflow. Customers, their records, the analysts' past calls and the review procedure are constructed. Footprint requests follow its public API reference and are answered by a local stand-in.</p></div>
   <div><h3>Run it yourself</h3><p>Python 3.10+.</p><pre>pip install -e ".[dev]"
 pytest -q
-golive run evals/golive.yml
-golive run evals/golive.baseline.yml</pre></div>
+python scripts/build_demo.py</pre><p style="margin-top:8px">Against Footprint: set FOOTPRINT_API_KEY, FOOTPRINT_WEBHOOK_SECRET and ANTHROPIC_API_KEY, then <code>python -m watchlist.server</code>.</p></div>
   <div><a class="pill" href="https://github.com/pg2342-hub/{REPO}">Code on GitHub</a></div>
 </aside>
 </div>
 </main>
-<script>
-const seg=[...document.querySelectorAll('.seg button')];
-seg.forEach(b=>b.addEventListener('click',()=>{{
- seg.forEach(x=>x.setAttribute('aria-checked',String(x===b)));
- const t=b.dataset.t;document.querySelectorAll('#cases tbody tr').forEach(r=>r.hidden=!(t==='all'||r.dataset.tier===t));
-}}));
-document.querySelectorAll('.cell').forEach(c=>{{
- const id=c.dataset.case;
- const lit=on=>document.querySelectorAll(`.cell[data-case="${{id}}"]`).forEach(x=>x.classList.toggle('lit',on));
- c.addEventListener('mouseenter',()=>lit(true));c.addEventListener('mouseleave',()=>lit(false));
- c.addEventListener('click',()=>{{
-  seg[0].click();
-  const row=document.getElementById('case-'+id);
-  document.querySelectorAll('#cases tr.lit').forEach(r=>r.classList.remove('lit'));
-  row&&row.classList.add('lit');
- }});
-}});
-</script></body></html>
+<script id="data" type="application/json">{data}</script>
+<script>{JS}</script></body></html>
 """
     for ch in ("—", "–"):
         if ch in html:
@@ -336,111 +231,156 @@ document.querySelectorAll('.cell').forEach(c=>{{
     (docs / "index.html").write_text(html, encoding="utf-8")
     subprocess.run([sys.executable, str(ROOT / "scripts" / "demo_chrome.py"), str(docs / "index.html"), "--repo", REPO], check=True)
     (docs / ".nojekyll").write_text("")
-    print("wrote docs/index.html")
+    print(f"wrote docs/index.html: {posted} passes posted, {40 - posted} to analyst")
 
 
 CSS = """
-/* Shared demo layout, copied from the approved pilots. Keep it; add page-specific rules below it. */
-
-.head{padding:8px 0 0}
-.head h1{margin:40px 0 14px}
-.head .lead{max-width:38em}
-/* verdict: the same 25 cases under the same gate, one square per case */
-.verdict{margin:36px 0 0;border:1px solid var(--rule);border-radius:16px;background:#fbfaf6;overflow:hidden}
-.vhead{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:8px 24px;padding:18px 24px;border-bottom:1px solid var(--rule)}
-.vhead h2{all:unset;font:400 22px/1.2 var(--serif)}
-.vhead p{margin:0;color:var(--ink-2);font-size:15px}
-.vhead p b{color:var(--ink)}
-.vrow,.arow{display:grid;grid-template-columns:minmax(0,15em) minmax(0,1fr) 7.5em 5.5em;align-items:center;gap:20px;padding:22px 24px}
-.vrow+.vrow{border-top:1px solid var(--rule-soft)}
-.vwho b,.awho b{display:block;font:400 20px/1.2 var(--serif)}
-.vwho span,.awho span{display:block;color:var(--ink-2);font-size:14px;line-height:1.4;margin-top:4px}
-.strip{display:grid;grid-template-columns:repeat(25,minmax(0,1fr));gap:4px}
-.cell{display:block;aspect-ratio:1;border-radius:4px;border:1.5px solid transparent;transition:transform .2s var(--ease),box-shadow .2s}
-.cell.pass{background:var(--green)}
-.cell.fail{background:var(--paper);border-color:var(--ink)}
-.cell.crit{background:var(--ink)}
-.cell:hover,.cell:focus-visible,.cell.lit{transform:translateY(-3px);box-shadow:0 6px 12px -6px rgb(27 26 23/.5)}
-.vscore b{font:400 44px/1 var(--serif)}
-.vscore span{display:block;color:var(--ink-2);font-size:13px;line-height:1.35;margin-top:4px}
-.gate{justify-self:end;display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:0 14px;border-radius:999px;font:500 13px/1 var(--mono);letter-spacing:.06em}
-.gate.go{background:var(--green-wash);color:var(--green)}
-.gate.nogo{background:var(--ink);color:var(--paper)}
-.legend{display:flex;flex-wrap:wrap;gap:6px 20px;padding:14px 24px;border-top:1px solid var(--rule);color:var(--ink-2);font-size:13px}
-.legend span{display:inline-flex;align-items:center;gap:8px}
-.legend i{width:12px;height:12px;border-radius:3px;border:1.5px solid transparent}
-.legend .pass{background:var(--green)}.legend .fail{border-color:var(--ink)}.legend .crit{background:var(--ink)}
-/* page body: content and a side column */
-.layout{display:grid;grid-template-columns:minmax(0,1fr) 270px;gap:56px;align-items:start;margin-top:8px}
-.side{position:sticky;top:24px;margin-top:64px;display:grid;gap:22px;font-size:14px;color:var(--ink-2)}
-.side h3{margin:0 0 6px;font:500 13px/1.3 var(--sans);color:var(--ink)}
-.side p{margin:0}
-.side nav a{display:block;padding:5px 0;color:var(--ink-2);text-decoration:none;border-bottom:1px solid var(--rule-soft)}
-.side nav a:hover{color:var(--ink)}
-.side pre{font-size:12px;margin:6px 0 0}
-.point{font-size:17px;max-width:40em;margin:0}
-.point b{font-weight:500}
-.seg{display:flex;width:fit-content;max-width:100%;flex-wrap:wrap;gap:2px;padding:3px;border:1px solid var(--rule);border-radius:999px;margin:0 0 16px;background:#fbfaf6}
-.seg button{min-height:34px;padding:0 14px;border:0;border-radius:999px;background:transparent;color:var(--ink-2);font:500 14px/1 var(--sans);cursor:pointer}
-.seg button span{font-weight:400;opacity:.8}
-.seg button[aria-checked=true]{background:var(--ink);color:var(--paper)}
-.n{font-family:var(--mono);font-size:13px}
-.tag{font:400 12px/1 var(--mono);border:1px solid var(--rule);border-radius:999px;padding:4px 8px;white-space:nowrap}
-.tx{max-width:340px}.ch{font-size:13px;color:var(--ink-2);margin-top:4px}
-.v{white-space:nowrap;font-weight:500}
-.v.ok{color:var(--green)}
-.v.bad{white-space:normal;color:var(--ink)}
-.v.bad.crit::before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--ink);margin-right:6px;vertical-align:1px}
-.why{font-weight:400;font-size:13px;color:var(--ink-2);margin-top:4px;max-width:240px}
-#cases tr.lit td{background:var(--green-wash)}
-#cases tr{scroll-margin-top:24px}
-.abl{border:1px solid var(--rule);border-radius:16px;background:#fbfaf6;overflow:hidden}
-.arow{grid-template-columns:minmax(0,13em) minmax(0,1fr) 6.5em}
-.arow+.arow{border-top:1px solid var(--rule-soft)}
-.ascore{font:400 15px/1 var(--sans);color:var(--ink-2)}
-.ascore b{font:400 30px/1 var(--serif);color:var(--ink)}
-.ascore span{display:block;font-size:13px;margin-top:4px}
-.note{color:var(--ink-2);font-size:15px;max-width:44em;margin-top:14px}
-.rule{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.rule div{border:1px solid var(--rule);border-radius:16px;padding:20px 22px;background:#fbfaf6}
-.rule div:last-child{background:var(--ink);color:var(--paper);border-color:var(--ink)}
-.rule h3{margin:0 0 6px;font:400 22px/1.2 var(--serif)}
-.rule p{margin:0 0 10px;font-size:15px;opacity:.85}
-.rule ul{margin:0;font-size:15px}
-.rule div:last-child li::marker{color:rgb(244 242 236/.6)}
-.sev{font:500 12px/1 var(--mono);padding:4px 8px;border-radius:999px;border:1px solid var(--rule)}
-.sev-critical{background:var(--ink);color:var(--paper);border-color:var(--ink)}
-.sev-low{color:var(--ink-2)}
-@media (max-width:1000px){
- .layout{grid-template-columns:minmax(0,1fr);gap:0}
- .side{position:static;margin-top:48px;order:2}
- .vrow{grid-template-columns:minmax(0,1fr) auto;gap:14px 16px}
- .vrow .strip{grid-column:1/-1;grid-row:2}
- .vscore{grid-row:3}.vrow .gate{grid-row:3}
- .arow{grid-template-columns:minmax(0,1fr) auto;gap:12px 16px}
- .arow .strip{grid-column:1/-1;grid-row:2}
- .ascore{grid-column:2;grid-row:1}
- .rule{grid-template-columns:1fr}
-}
-@media (max-width:640px){.vrow,.arow{padding:18px}.vhead{padding:16px 18px}.strip{gap:3px}.tx{max-width:none}}
-@media (prefers-reduced-motion:reduce){.cell{transition:none}}
-
-
-/* page-specific */
+.head h1{margin:24px 0 12px}
+.head .lead{max-width:56em;margin:0}
+.desk{display:grid;grid-template-columns:minmax(0,4fr) minmax(0,7fr);grid-template-areas:"in doc" "rec doc";grid-template-rows:auto 1fr;gap:20px 24px;align-items:start;margin-top:28px;scroll-margin-top:16px}
+.compose{grid-area:in;border:1px solid var(--rule);border-radius:16px;background:#fbfaf6;padding:18px 20px}
+.lab{font:500 15px/1.3 var(--sans);margin:0 0 10px}
+.compose .seg{margin:0 0 12px}
+.compose .seg button{padding:0 12px;font-size:13.5px}
+.plist{display:grid;gap:4px;max-height:430px;overflow:auto;margin:0 -6px;padding:0 6px}
+.pi{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;align-items:center;text-align:left;width:100%;padding:8px 10px;border:1px solid transparent;border-radius:10px;background:transparent;font:inherit;color:var(--ink);cursor:pointer}
+.pi:hover{background:#fff;border-color:var(--rule)}
+.pi[aria-selected=true]{background:#fff;border-color:var(--ink)}
+.pi b{font-weight:500;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pi small{grid-column:1;font-size:12.5px;color:var(--ink-2)}
+.pi .dot{grid-row:1/3;grid-column:2;width:10px;height:10px;border-radius:3px}
+.dot.posted_pass{background:var(--green)}
+.dot.sent_to_analyst{background:var(--paper);border:1.5px solid var(--ink)}
+.rec{grid-area:rec;border:1px solid var(--rule);border-radius:16px;padding:18px 20px;min-width:0}
+.rec h2,.doc h2,.doc h3{all:unset;display:block}
+.rec h2{font:500 15px/1.3 var(--sans)}
+.rec p{margin:4px 0 12px;font-size:13.5px;color:var(--ink-2)}
+.kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:3px 14px;margin:0;font:12px/1.55 var(--mono)}
+.kv dt{color:var(--ink-2)}
+.kv dd{margin:0;overflow-wrap:anywhere}
+.kv .nul{color:var(--ink-2);opacity:.65}
+.kv .gap{grid-column:1/-1;height:8px;border-bottom:1px solid var(--rule-soft);margin-bottom:6px}
+.doc{grid-area:doc;border:1px solid var(--rule);border-radius:16px;background:#fff;box-shadow:0 1px 0 rgb(27 26 23/.04),0 24px 48px -32px rgb(27 26 23/.35);min-width:0;overflow:hidden}
+.dhead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px 20px;padding:22px 26px 16px;border-bottom:1px solid var(--rule)}
+.dhead>div{min-width:0}
+.doc h2{font:400 28px/1.15 var(--serif)}
+.dsub{font:12.5px/1.5 var(--mono);color:var(--ink-2);margin-top:6px;overflow-wrap:anywhere}
+.status{display:inline-flex;align-items:center;min-height:30px;padding:0 14px;border-radius:999px;font:500 12.5px/1 var(--mono);letter-spacing:.04em;border:1px solid var(--ink);white-space:nowrap}
+.s-posted_pass{background:var(--green-wash);border-color:var(--green-wash);color:var(--green)}
+.s-sent_to_analyst{background:var(--ink);color:var(--paper)}
+.meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 20px;margin:0;padding:14px 26px;border-bottom:1px solid var(--rule);background:#fbfaf6}
+.meta dt{font-size:12.5px;color:var(--ink-2)}
+.meta dd{margin:2px 0 0;font-size:14.5px;overflow-wrap:anywhere}
+.dpad{padding:6px 26px 22px}
+.hit{margin-top:18px;padding-bottom:16px;border-bottom:1px solid var(--rule)}
+.hit:last-child{border-bottom:0;padding-bottom:0}
+.hh{display:flex;justify-content:space-between;align-items:baseline;gap:8px 14px;flex-wrap:wrap}
+.hh h3{font:500 15px/1.35 var(--sans)}
+.hh .code{font:12px/1.4 var(--mono);color:var(--ink-2)}
+.call{display:inline-block;font:500 11.5px/1.7 var(--mono);padding:0 9px;border-radius:999px;border:1px solid var(--ink);white-space:nowrap}
+.call.clear{background:var(--green-wash);border-color:var(--green-wash);color:var(--green)}
+.call.escalate{background:var(--ink);color:var(--paper)}
+.cmp{width:100%;margin:10px 0 0;font-size:13.5px;border-collapse:collapse}
+.cmp th{font:500 12px/1.3 var(--sans);color:var(--ink-2);text-align:left;padding:4px 8px 4px 0;border-bottom:1px solid var(--rule)}
+.cmp td{padding:6px 8px 6px 0;border-bottom:1px solid var(--rule-soft);vertical-align:top;overflow-wrap:anywhere}
+.cmp td.r{font:12px/1.5 var(--mono);white-space:nowrap}
+.cmp td.r.mismatch{color:var(--green)}
+.cmp td.r.match{font-weight:600}
+.nar{margin:10px 0 0;font-size:14px}
+.nar b{font-weight:500}
+.gr{margin:10px 0 0;border:1.5px dashed var(--ink);border-radius:10px;padding:8px 12px;font-size:13.5px}
+.an{margin:8px 0 0;font-size:12.5px;color:var(--ink-2)}
+.calls{border-top:1px solid var(--rule);background:#fbfaf6;padding:14px 26px 16px}
+.calls h3{font:500 14px/1.35 var(--sans);margin-bottom:6px}
+.calls ol{list-style:none;margin:0;padding:0;display:grid;gap:6px}
+.calls li{font:12.5px/1.5 var(--mono);margin:0}
+.calls .m{display:inline-block;min-width:3.6em;font-weight:600}
+.calls .st{color:var(--green);margin-left:6px}
+.calls details{margin-top:2px}
+.calls summary{cursor:pointer;color:var(--ink-2);font:12px var(--sans)}
+.calls pre{font-size:11.5px;margin:6px 0 0;max-height:240px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.brief{margin:12px 0 0}
+.brief pre{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0 0}
+.prov{display:flex;gap:8px;align-items:baseline;padding:12px 26px;border-top:1px solid var(--rule);font-size:12.5px;color:var(--ink-2);margin:0}
+.prov i{flex:none;width:7px;height:7px;border-radius:50%;background:var(--green);transform:translateY(-1px)}
+.content section{scroll-margin-top:16px}
+.steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px}
+.step{border:1px solid var(--rule);border-radius:16px;background:#fbfaf6;padding:18px 20px;min-width:0}
+.step h3{margin:0 0 6px;font:400 21px/1.25 var(--serif);display:flex;gap:10px;align-items:baseline}
+.step h3 span{font:400 15px/1 var(--serif);color:var(--green);min-width:12px}
+.step p{margin:0;font-size:14.5px;color:var(--ink-2)}
+.step p b{color:var(--ink)}
+#backtest .verdict{margin-top:20px}
+h3.sub{font:400 21px/1.25 var(--serif);margin:28px 0 6px}
+ul.lim{margin:0;padding-left:20px;max-width:46em}
+ul.lim li{margin-bottom:10px}
 .strip{grid-template-columns:repeat(20,minmax(0,1fr))}
-.gate.part{background:repeating-linear-gradient(45deg,var(--paper) 0 4px,var(--rule) 4px 6px);color:var(--ink);border:1.5px solid var(--ink)}
-.flow{width:100%;height:auto;display:block;margin:4px 0 8px}
-.flow .fl{font:400 13px var(--sans);fill:var(--ink)}
-.flow .fn,.flow .fk{font:400 12px var(--mono);fill:var(--ink-2);font-variant-numeric:tabular-nums}
-.hits{list-style:none;margin:0;padding:0;display:grid;gap:10px;font-size:14px}
-.hits li{border-bottom:1px solid var(--rule-soft);padding-bottom:8px}
-.hits li:last-child{border-bottom:0}
-.hx{min-width:300px}
-details summary{cursor:pointer;color:var(--ink-2);font-size:13px;margin-top:4px}
-details p{font-size:14px;margin:6px 0 0}
-@media (max-width:640px){.strip{grid-template-columns:repeat(10,minmax(0,1fr))}.hx{min-width:220px}}
+@media (max-width:860px){.desk{grid-template-columns:minmax(0,1fr);grid-template-areas:"in" "doc" "rec"}.plist{max-height:260px}}
+@media (max-width:640px){
+ .dhead{padding:18px 18px 14px}.doc h2{font-size:24px}
+ .meta{grid-template-columns:repeat(2,minmax(0,1fr));padding:12px 18px}
+ .dpad{padding:4px 18px 18px}.calls,.prov{padding-left:18px;padding-right:18px}
+ .steps{grid-template-columns:minmax(0,1fr)}
+ .cmp th:nth-child(4),.cmp td:nth-child(4){display:none}
+ .strip{grid-template-columns:repeat(10,minmax(0,1fr))}
+}
 """
 
+JS = r"""
+const D=JSON.parse(document.getElementById('data').textContent);
+const by=Object.fromEntries(D.rows.map(r=>[r.id,r]));
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const LABEL={posted_pass:'PASS POSTED',sent_to_analyst:'TO ANALYST'};
+const KIND={likely_match:'likely match',need_info:'need more information',dob:'DOB rules it out',gender:'gender rules it out'};
+let filter='all',cur=D.start;
+function list(){
+  const el=document.getElementById('plist');
+  el.innerHTML=D.rows.filter(r=>filter==='all'||r.action===filter).map(r=>
+    `<button type="button" class="pi" role="option" aria-selected="${r.id===cur}" data-id="${r.id}"><b>${esc(r.name)}</b><span class="dot ${r.action}" aria-hidden="true"></span><small>${r.hits.length} hit${r.hits.length>1?'s':''}, ${r.action==='posted_pass'?'pass posted':'sent to analyst'}</small></button>`).join('');
+  el.querySelectorAll('.pi').forEach(b=>b.addEventListener('click',()=>show(b.dataset.id)));
+}
+function kv(r){
+  const ev=Object.entries(r.event).map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(JSON.stringify(v))}</dd>`).join('');
+  const dec=r.trace.find(t=>t.path.endsWith('/vault/decrypt'));
+  const f=dec?Object.entries(dec.resp).map(([k,v])=>`<dt>${esc(k)}</dt><dd${v==null?' class="nul"':''}>${v==null?'null':esc(v)}</dd>`).join(''):'';
+  document.getElementById('kv').innerHTML=ev+'<div class="gap"></div>'+f;
+}
+function hit(h){
+  const rows=(h.comparisons||[]).map(c=>`<tr><td>${esc(c.attribute)}</td><td>${esc(c.customer_value)}</td><td>${esc(c.list_value)}</td><td class="r ${esc(c.result)}">${esc(c.result)}</td></tr>`).join('');
+  const prop=h.proposed.call!==h.final.call||h.proposed.kind!==h.final.kind;
+  return `<div class="hit"><div class="hh"><h3>SDN ${esc(h.uid)} ${esc(h.name)} <span class="code">name score ${h.score.toFixed(2)}, ${esc(h.programs.join(', '))}</span></h3><span class="call ${h.final.call}">${h.final.call.toUpperCase()}: ${esc(KIND[h.final.kind])}</span></div>
+  ${rows?`<table class="cmp"><thead><tr><th>Attribute</th><th>Customer</th><th>List entry</th><th>Result</th></tr></thead><tbody>${rows}</tbody></table>`:''}
+  ${prop?`<div class="gr"><b>Code changed the call.</b> Claude proposed ${esc(h.proposed.call)} (${esc(KIND[h.proposed.kind]||h.proposed.kind)}): ${esc(h.guardrail||'')}</div>`:''}
+  <p class="nar"><b>Claude's note.</b> ${esc(h.narrative)}</p>
+  ${h.final.call==='escalate'&&h.next_step?`<p class="nar"><b>Next step.</b> ${esc(h.next_step)}</p>`:''}
+  <p class="an">The analyst's past call on this hit: ${esc(h.analyst.call)} (${esc(KIND[h.analyst.kind])}).</p></div>`;
+}
+function show(id){
+  cur=id;const r=by[id];
+  document.querySelectorAll('.pi').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.id===id)));
+  const calls=r.trace.map(t=>{
+    const body=t.body?`<details><summary>request</summary><pre>${esc(JSON.stringify(t.body,null,1))}</pre></details>`:'';
+    const resp=t.resp?`<details><summary>response</summary><pre>${esc(JSON.stringify(t.resp,null,1))}</pre></details>`:'';
+    return `<li><span class="m">${t.method}</span>${esc(t.path)}<span class="st">${t.status}</span>${body}${resp}</li>`}).join('');
+  const dec=r.action==='posted_pass'?'pass posted':'none, review left open';
+  document.getElementById('doc').innerHTML=`<div class="dhead"><div><h2>${esc(r.name)}</h2><div class="dsub">${esc(r.event.fp_id)} / ${esc(r.event.onboarding_id)}</div></div><span class="status s-${r.action}">${LABEL[r.action]}</span></div>
+  <dl class="meta"><div><dt>OFAC hits</dt><dd>${r.hits.length}</dd></div><div><dt>Decision written</dt><dd>${dec}</dd></div><div><dt>Claude review</dt><dd>${r.meta.latency_s?r.meta.latency_s.toFixed(1)+' s, $'+r.meta.cost_usd.toFixed(4):'n/a'}</dd></div></dl>
+  <div class="dpad">${r.hits.map(hit).join('')}
+  ${r.brief?`<div class="brief"><details><summary>Case brief left for the analyst</summary><pre>${esc(r.brief)}</pre></details></div>`:''}</div>
+  <div class="calls"><h3>Footprint API calls, in order</h3><ol>${calls}</ol></div>
+  <p class="prov"><i aria-hidden="true"></i><span>Claude review recorded ${esc(D.recorded)} (${esc(D.model)}) and replayed through the current code. Footprint answered by the local stand-in.</span></p>`;
+  kv(r);
+}
+document.querySelectorAll('.compose .seg button').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.compose .seg button').forEach(x=>x.setAttribute('aria-checked',String(x===b)));
+  filter=b.dataset.f;list();
+}));
+document.querySelectorAll('.cell').forEach(c=>c.addEventListener('click',e=>{
+  e.preventDefault();filter='all';document.querySelector('.compose .seg button').click();show(c.dataset.case);
+  document.getElementById('tool').scrollIntoView({behavior:'smooth'});
+}));
+list();show(cur);
+"""
 
 if __name__ == "__main__":
     main()
