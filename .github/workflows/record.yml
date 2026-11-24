@@ -4,6 +4,12 @@ name: Record a live run
 # and commits them. Needs the ANTHROPIC_API_KEY secret.
 on:
   workflow_dispatch:
+    inputs:
+      redo:
+        description: "all = new review and judge replies; judge = keep the recorded reviews, grade them again"
+        default: all
+        type: choice
+        options: [all, judge]
 
 permissions:
   contents: write
@@ -23,7 +29,14 @@ jobs:
       - name: Live run (3 runs of 40 customers, Claude review + Claude judge)
         run: |
           test -n "$ANTHROPIC_API_KEY" || { echo "Set the ANTHROPIC_API_KEY repo secret first"; exit 1; }
-          rm -f recordings/reviewer.jsonl recordings/judge.jsonl
+          # fail fast if the judge cannot be called at all
+          python -c "from golive_gate import ClaudeJudge; print(ClaudeJudge()('Reply with exactly this line: VERDICT: PASS - smoke test').text)"
+          if [ "${{ inputs.redo }}" = "judge" ]; then
+            rm -f recordings/judge.jsonl
+            sed -i 's/agent:live_agent/agent:recorded_agent/' evals/golive.live.yml
+          else
+            rm -f recordings/reviewer.jsonl recordings/judge.jsonl
+          fi
           set +e
           golive run evals/golive.live.yml --out reports/live
           code=$?
@@ -33,6 +46,27 @@ jobs:
           test "$code" -ne 3
           # keep only a complete recording: 120 review calls (40 customers x 3 runs)
           test "$(wc -l < recordings/reviewer.jsonl)" -eq 120 || { echo "incomplete recording, not committing"; exit 1; }
+          git checkout evals/golive.live.yml
+      - name: Show every failed check with its reason
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("reports/live/results.json")
+          if p.exists():
+              for c in json.loads(p.read_text())["cases"]:
+                  for r in c["runs"]:
+                      for cid, v in r["verdicts"].items():
+                          if v["result"] == "fail":
+                              print(f"{c['id']} run {r['run']} {cid}: {v['reason']}")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-run
+          path: |
+            reports/live
+            recordings
       - name: Rebuild the demo page from the recording
         # replay only: with GOLIVE_LIVE unset the judge replays the recording instead of grading again
         run: |
@@ -41,6 +75,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add recordings docs
+          git add recordings
+          if [ -d docs ]; then git add docs; fi
           git commit -m "Record live run" || echo "nothing to commit"
           git push

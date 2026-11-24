@@ -32,6 +32,8 @@ ignore = ["E402"]
 
 [tool.ruff.lint.per-file-ignores]
 "watchlist/reviewer.py" = ["E501"]
+"scripts/build_demo.py" = ["E501"]
+"scripts/make_cases.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["watchlist"]
