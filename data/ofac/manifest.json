@@ -1,0 +1,18 @@
+{
+  "source": "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/",
+  "fetched_utc": "2026-11-24T05:12:04Z",
+  "files": {
+    "sdn.csv": {
+      "bytes": 5855269,
+      "sha256": "89b2a6d6d825d3a0a5033c9d523ef8a5e05a0b766ccff1ad934aea7436da49b9"
+    },
+    "alt.csv": {
+      "bytes": 1066818,
+      "sha256": "2e342dc26cd1df3e11efba14d54d61d9290e255b502667b5eb2244e203b3ff5a"
+    },
+    "add.csv": {
+      "bytes": 1701883,
+      "sha256": "58f0cf56d797937de3f1bc7365646e38a440636bbaaed3a3d9cfe8db7e5c2579"
+    }
+  }
+}
