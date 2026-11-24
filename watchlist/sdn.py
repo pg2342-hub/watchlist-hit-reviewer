@@ -85,6 +85,7 @@ class Entry:
     programs: list[str]
     aliases: list[str] = field(default_factory=list)
     dobs: list[Dob] = field(default_factory=list)
+    dob_unread: list[str] = field(default_factory=list)  # listed DOB text the parser could not read
     pob: list[str] = field(default_factory=list)
     nationality: list[str] = field(default_factory=list)
     citizen: list[str] = field(default_factory=list)
@@ -113,9 +114,12 @@ def _parse_remarks(e: Entry) -> None:
         s = seg.strip().rstrip(".")
         low = s.lower()
         if low.startswith(("dob ", "alt. dob ")):
-            d = parse_dob(s.split("DOB", 1)[1])
+            raw = s.split("DOB", 1)[1].strip()
+            d = parse_dob(raw)
             if d:
                 e.dobs.append(d)
+            else:
+                e.dob_unread.append(raw)
         elif low.startswith(("pob ", "alt. pob ")):
             e.pob.append(s.split("POB", 1)[1].strip())
         elif low.startswith(("nationality ", "alt. nationality ")):

@@ -60,7 +60,9 @@ def validate_signal(s: dict) -> None:
     missing = {"reason_code", "note", "description", "severity", "scopes", "timestamp"} - s.keys()
     if missing:
         raise ValueError(f"risk signal missing {sorted(missing)}")
-    if s["reason_code"] not in REASON_CODES or s["severity"] not in SEVERITIES or not set(s["scopes"]) <= SCOPES:
+    # Footprint has many reason codes beyond the two OFAC ones; any snake_case code is accepted
+    code_ok = isinstance(s["reason_code"], str) and s["reason_code"].replace("_", "").isalnum() and s["reason_code"].islower()
+    if not code_ok or s["severity"] not in SEVERITIES or not set(s["scopes"]) <= SCOPES:
         raise ValueError(f"risk signal has a value Footprint does not list: {s}")
 
 

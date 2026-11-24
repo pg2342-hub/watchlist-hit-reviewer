@@ -105,3 +105,47 @@ def test_webhook_endpoint_checks_signature():
     assert requests.post(url, data=body, headers={**ok, "svix-signature": "v1,AAAA"}, timeout=5).status_code == 401
     srv.shutdown()
     assert work.get_nowait()["fp_id"] == CASES[0]["input"]["fp_id"] and work.empty()
+
+
+def test_other_risk_signals_hold_the_pass(sandbox):
+    c = next(x for x in CASES if x["group"] == "dob_clear")
+    user = sandbox.store.users[c["input"]["fp_id"]]
+    saved = list(user["risk_signals"])
+    user["risk_signals"] = saved + [
+        {
+            "reason_code": "document_possible_fake",
+            "note": "x",
+            "description": "x",
+            "severity": "high",
+            "scopes": ["document"],
+            "timestamp": "t",
+        }
+    ]
+    try:
+        fp = FootprintClient("sk_test_standin", sandbox.url)
+        r = agent.handle(event(c), fp, review)
+    finally:
+        user["risk_signals"] = saved
+    assert r["action"] == "sent_to_analyst" and "other risk signals" in r["brief"]
+    assert not [t for t in fp.trace if t["path"].endswith("/decisions")]
+
+
+def test_pass_needs_footprints_flagged_entry_to_be_reviewed():
+    sig = {"reason_code": "watchlist_hit_ofac", "description": "Name matched OFAC SDN entry 999 (X)", "severity": "high"}
+    assert "did not cover" in agent.hold_reason([sig], {"123"})
+    assert agent.hold_reason([sig], {"999", "123"}) is None
+    assert "does not name" in agent.hold_reason([{**sig, "description": "OFAC hit"}], {"999"})
+
+
+def test_webhook_retries_are_reviewed_once():
+    work = queue.Queue()
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_app(SECRET, work))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/webhooks/footprint"
+    body = json.dumps(event(CASES[0])).encode()
+    now = int(time.time())
+    h = {"svix-id": "msg_dup", "svix-timestamp": str(now), "svix-signature": sign(SECRET, "msg_dup", now, body)}
+    for _ in range(2):
+        assert requests.post(url, data=body, headers=h, timeout=5).status_code == 202
+    srv.shutdown()
+    assert work.qsize() == 1

@@ -23,6 +23,8 @@ from .svix import InvalidSignature, verify
 
 
 def make_app(secret: str, work: queue.Queue):
+    seen: dict[str, None] = {}  # svix-id of recent deliveries: Svix retries, and a retry must not be reviewed twice
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -40,7 +42,12 @@ def make_app(secret: str, work: queue.Queue):
                 self.send_response(401)
                 self.end_headers()
                 return
-            work.put(event)
+            msg_id = self.headers.get("svix-id", "")
+            if msg_id not in seen:
+                seen[msg_id] = None
+                if len(seen) > 10_000:
+                    seen.pop(next(iter(seen)))
+                work.put(event)
             self.send_response(202)
             self.end_headers()
 
@@ -52,7 +59,11 @@ def worker(work: queue.Queue, out: Path, review, api_key: str, base_url: str) ->
         event = work.get()
         if event is None:
             return
-        result = agent.handle(event, FootprintClient(api_key, base_url), review)
+        try:
+            result = agent.handle(event, FootprintClient(api_key, base_url), review)
+        except Exception as exc:  # one bad event must not stop the worker; the review stays open for a person
+            print(f"{event.get('fp_id')}: error, left for an analyst: {type(exc).__name__}: {exc}", flush=True)
+            continue
         print(f"{result['fp_id']}: {result['action']}", flush=True)
         if result.get("brief"):
             out.mkdir(parents=True, exist_ok=True)

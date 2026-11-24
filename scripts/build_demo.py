@@ -143,13 +143,14 @@ def main() -> None:
     elif crit == 0 and vague:
         gate_line = (
             f"The gate still holds it at {rec['decision'].upper()}, on wording alone: on {len(vague)} escalations the next step "
-            "left for the analyst was too vague to act on, and every listed person's case must pass every check."
+            "left for the analyst was too vague to act on, and every listed person's case, and every case that cannot be ruled out, must pass every check."
         )
     else:
         gate_line = f"The gate holds it at {rec['decision'].upper()}."
     blocked = sum(1 for r in outcomes if bt.outcome(r) == "blocked")
     posted = sum(1 for r in rows if r["action"] == "posted_pass")
-    metas = [r["meta"] for r in rows if r["meta"].get("latency_s")]
+    metas = [x["runs"][i]["output"]["_meta"] for x in rec["cases"] for i in range(3) if x["runs"][i]["output"]["_meta"].get("latency_s")]
+    retried = sum(1 for m in metas if m.get("retried"))
     model = metas[0]["model"] if metas else ""
     mean_cost = sum(m["cost_usd"] for m in metas) / max(len(metas), 1)
     mean_lat = sum(m["latency_s"] for m in metas) / max(len(metas), 1)
@@ -219,7 +220,7 @@ def main() -> None:
   <h3 class="sub">Where every hit landed</h3>
   <p class="note" style="margin:0 0 12px">All {n_hits} hits on run 1, grouped by the analyst's call. A hatched block is a clear Claude proposed and code blocked ({blocked} on run 1).</p>
   {bt.flow_svg(outcomes)}
-  <p class="note">Recorded live run, {escape(rec_date)}: {escape(model)}, one call per customer, mean ${mean_cost:.4f} and {mean_lat:.1f} s per customer. CI replays the recorded replies through the current code, so it needs no API key.</p>
+  <p class="note">Recorded live run, {escape(rec_date)}: {escape(model)}, mean ${mean_cost:.3f} and {mean_lat:.1f} s per customer over all 3 runs, including the {retried} of {len(metas)} reviews that came back with an empty field and were asked once more. CI replays the recorded replies through the current code, so it needs no API key.</p>
 </section>
 
 <section id="limits">
@@ -227,7 +228,8 @@ def main() -> None:
   <ul class="lim">
     <li>Footprint's sandbox needs company approval, so Footprint is not called here. The client sends the requests Footprint's public API reference describes, and a local stand-in answers them in the same shapes. The document field names (<code>document.passport.dob</code> and similar) should be confirmed on an account.</li>
     <li>Customers and the analysts' past calls are constructed; the list entries are real. A bank's own past reviews would replace the 40 cases before any pilot.</li>
-    <li>Candidate list entries come from this repo's own screen of the SDN list, at the same threshold that raised the hit. Footprint's own match details, where an account exposes them, would replace that step.</li>
+    <li>Candidate list entries come from this repo's own screen of the SDN list. A pass is posted only if every entry Footprint's signal names was among those reviewed, and only if no other risk signal (a document, PEP or adverse media flag) is open; wiring in Footprint's own match details is a pilot prerequisite.</li>
+    <li>The same written procedure produced the analysts' calls and guides Claude, so agreement here shows the agent and its guardrails follow a procedure, not how it does on a bank's real history. The useful signal is the other way round: the gate caught the name cutoff clearing listed people.</li>
   </ul>
 </section>
 </div>

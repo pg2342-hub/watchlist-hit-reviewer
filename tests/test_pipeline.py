@@ -173,3 +173,37 @@ def test_rule_checks_pass_for_oracle_and_catch_a_false_clear():
         if c["expected"]["calls"][h["uid"]]["call"] == "escalate":
             h["final"] = {"call": "clear", "kind": "dob"}
     assert checks["no_false_clear"].run(case, out).result == FAIL
+
+
+def _facts_case(group):
+    return copy.deepcopy(next(c for c in CASES if c["group"] == group))
+
+
+def test_typed_dob_cannot_outvote_the_id_document():
+    case = _facts_case("true_match")
+    uid = next(u for u, k in case["expected"]["calls"].items() if k["kind"] == "likely_match")
+    cust = case["input"]["customer"]
+    if cust["document"].get("dob") is None:
+        cust["document"]["dob"] = cust["vault"]["id.dob"]
+    cust["vault"]["id.dob"] = "1990-01-01"  # typed a different DOB; the passport still shows the listed one
+    f = pipeline.confirm(cust, uid)
+    assert f["dobs_disagree"] and not f["dob_rules_out"]
+    assert pipeline.guard({"call": "clear", "kind": "dob"}, f)[0] == "escalate"
+
+
+def test_gender_clear_needs_a_dob_on_file():
+    f = {"dob_exact_match": False, "dob_rules_out": False, "gender_differs": True, "dob_on_file": False, "dobs_disagree": False}
+    assert pipeline.guard({"call": "clear", "kind": "gender"}, f) == ("escalate", "need_info", "clear blocked: no DOB on file")
+
+
+def test_unreadable_listed_dob_blocks_a_dob_clear(monkeypatch):
+    from watchlist import sdn
+
+    case = _facts_case("dob_clear")
+    uid = next(iter(case["expected"]["calls"]))
+    e = pipeline.entry(uid)
+    monkeypatch.setattr(e, "dob_unread", ["circa 1979-1982"])
+    f = pipeline.confirm(case["input"]["customer"], uid)
+    assert not f["dob_rules_out"]
+    assert "could not be read" in pipeline.guard({"call": "clear", "kind": "dob"}, f)[2]
+    assert isinstance(e, sdn.Entry)

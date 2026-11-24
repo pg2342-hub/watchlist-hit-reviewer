@@ -20,21 +20,44 @@ from .screen import entry, screen
 
 
 def customer_dob(customer: dict) -> str | None:
+    """The DOB the review quotes: the vault's, else the ID document's."""
     return customer["vault"].get("id.dob") or customer["document"].get("dob")
 
 
+def dobs_on_file(customer: dict) -> list[str]:
+    """Every distinct DOB on file: the typed-in vault DOB and the one read off the ID document."""
+    out = []
+    for d in (customer["vault"].get("id.dob"), customer["document"].get("dob")):
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
 def confirm(customer: dict, uid: str) -> dict:
-    """What code can establish about one hit on its own: DOB results per listed DOB, and gender."""
+    """What code can establish about one hit on its own: DOB results per listed DOB, and gender.
+
+    A DOB rules the listed person out only if every DOB on file (vault and ID document) misses every listed
+    DOB, the vault and document agree, and the parser read every listed DOB.
+    """
     e = entry(uid)
+    on_file = dobs_on_file(customer)
     dob = customer_dob(customer)
-    results = [d.compare(dob) for d in e.dobs] if dob else []
+    unread = list(e.dob_unread)
+    try:
+        results = [d.compare(dob) for d in e.dobs] if dob else []
+        every = [d.compare(x) for x in on_file for d in e.dobs]
+    except ValueError:  # a DOB on file in a format code cannot compare: nothing is ruled out on it
+        results, every = [], []
+        unread.append(f"customer DOB {dob!r} is not YYYY-MM-DD")
     gender = customer["document"].get("gender")
     return {
-        "dob_on_file": dob is not None,
+        "dob_on_file": bool(on_file),
+        "dobs_disagree": len(on_file) > 1,
         "listed_dobs": [d.text for d in e.dobs],
+        "listed_dobs_unread": unread,
         "dob_results": results,
-        "dob_rules_out": bool(dob and e.dobs and all(r == "mismatch" for r in results)),
-        "dob_exact_match": "match" in results,
+        "dob_rules_out": bool(on_file and e.dobs and not unread and len(on_file) == 1 and all(r == "mismatch" for r in every)),
+        "dob_exact_match": "match" in every,
         "gender_differs": bool(gender and e.gender and gender[0].upper() != e.gender[0].upper()),
     }
 
@@ -68,19 +91,30 @@ def guard(proposed: dict, facts: dict) -> tuple[str, str, str | None]:
     if proposed["call"] == "clear":
         if proposed["kind"] == "dob" and facts["dob_rules_out"]:
             return "clear", "dob", None
-        if proposed["kind"] == "gender" and facts["gender_differs"]:
+        if proposed["kind"] == "gender" and facts["gender_differs"] and facts["dob_on_file"] and not facts["dobs_disagree"]:
             return "clear", "gender", None
-        why = (
-            "no DOB on file"
-            if not facts["dob_on_file"]
-            else ("a listed DOB does not rule the customer out" if proposed["kind"] == "dob" else "genders do not differ on file")
-        )
+        if not facts["dob_on_file"]:
+            why = "no DOB on file"
+        elif facts["dobs_disagree"]:
+            why = "the vault DOB and the ID document DOB disagree"
+        elif facts.get("listed_dobs_unread"):
+            why = "a listed DOB could not be read: " + "; ".join(facts["listed_dobs_unread"])
+        elif proposed["kind"] == "dob":
+            why = "a listed DOB does not rule the customer out"
+        else:
+            why = "genders do not differ on file"
         return "escalate", "need_info", f"clear blocked: {why}"
     kind = proposed["kind"] if proposed["kind"] in ("likely_match", "need_info") else "need_info"
     return "escalate", kind, None
 
 
-def run(case_input: dict, review: Callable[[dict], dict], footprint: FakeFootprint | None = None) -> dict:
+def run(
+    case_input: dict,
+    review: Callable[[dict], dict],
+    footprint: FakeFootprint | None = None,
+    hold: str | None = None,
+) -> dict:
+    """Review every hit and write a pass when all are cleared, unless `hold` says why nothing may be posted."""
     customer = case_input["customer"]
     name = " ".join(
         x for x in (customer["vault"]["id.first_name"], customer["vault"].get("id.middle_name"), customer["vault"]["id.last_name"]) if x
@@ -124,7 +158,7 @@ def run(case_input: dict, review: Callable[[dict], dict], footprint: FakeFootpri
             }
         )
     unknown = sorted(set(by_uid) - {h["uid"] for h in hits})
-    if out_hits and all(h["final"]["call"] == "clear" for h in out_hits):
+    if out_hits and all(h["final"]["call"] == "clear" for h in out_hits) and not hold:
         note = " ".join(f"[{h['uid']}] {h['narrative']}" for h in out_hits)
         footprint.post_decision(case_input["fp_id"], "pass", note)
     return {
@@ -133,6 +167,7 @@ def run(case_input: dict, review: Callable[[dict], dict], footprint: FakeFootpri
         "risk_signals": signals,
         "hits": out_hits,
         "unknown_reviews": unknown,
+        "held": hold if out_hits and all(h["final"]["call"] == "clear" for h in out_hits) else None,
         "footprint_requests": footprint.requests,
         "_meta": reply.get("_meta", {}),
     }

@@ -6,7 +6,7 @@ Demo page: https://pranavgudise.dev/watchlist-hit-reviewer/ (pick any of 40 cust
 
 An agent for KYC teams on Footprint. When an onboarding lands in manual review with an OFAC watchlist hit, it reads the risk signals, decrypts only the fields the review needs, has Claude compare each hit with the customer under a written procedure, and posts a pass only when code confirms the hit is not the customer. Everything else stays in manual review, with a case brief for the analyst. It never posts a fail.
 
-**Latest recorded live run (November 24, 2026, `claude-opus-5-5`, medium effort, 40 customers x 3 runs):** the agent made the analyst's call on **59 of 59 hits on every run**, with **zero wrong clears**, and posted a pass for **22 of 40** customers, every one of them a customer the analyst had cleared. The gate is still **NO-GO**, on wording alone: on 2 escalations the next step left for the analyst was too vague to act on, and the gate requires every listed person's case to pass every check. A name-score cutoff cleared 2 listed people who onboarded under another spelling (NO-GO with critical errors). Mean $0.035 and 9.6 s per customer for the review; the judge cost $1.63 for all 3 runs.
+**Latest recorded live run (November 24, 2026, `claude-opus-5-5`, medium effort, 40 customers x 3 runs):** the agent made the analyst's call on **59 of 59 hits on every run**, with **zero wrong clears**, and posted a pass for **22 of 40** customers, every one of them a customer the analyst had cleared. The gate is still **NO-GO**, on wording alone: on 2 escalations the next step left for the analyst was too vague to act on, and the gate requires every listed person's case, and every case that cannot be ruled out, to pass every check. A name-score cutoff cleared 2 listed people who onboarded under another spelling (NO-GO with critical errors). Mean $0.035 and 9.6 s per customer for the review over all 3 runs, including the 19 of 120 reviews that came back with an empty field and were asked once more; the judge cost $1.63 for all 3 runs.
 
 ## What it does, step by step
 
@@ -14,8 +14,8 @@ An agent for KYC teams on Footprint. When an onboarding lands in manual review w
 2. **Read.** `GET /users/{fp_id}/onboardings/{onboarding_id}/risk_signals`. No `watchlist_hit_ofac` signal, nothing to do.
 3. **Decrypt, scoped.** `POST /users/{fp_id}/vault/decrypt` for name, DOB, nationality, address and the ID document's DOB and gender, with a reason Footprint logs. No SSN, email or phone.
 4. **Review.** Candidate entries come from the real OFAC SDN list. Claude (`claude-opus-5-5`, structured output) compares DOB, gender, nationality, place of birth and aliases for every hit and proposes clear or escalate, with the deciding fact, an audit note and, for an escalation, the next thing to obtain.
-5. **Guard.** Code decides what may be written. A clear stands only if code confirms its deciding fact (the customer's DOB differs from every listed DOB, or both genders are on file and differ). A listed full DOB equal to the customer's always escalates. A hit with no review, or a review with no note, escalates.
-6. **Write.** `POST /users/{fp_id}/decisions` with `status: pass` and the notes as the annotation, only when every hit is cleared. Otherwise the review stays open and the analyst gets the brief.
+5. **Guard.** Code decides what may be written. A DOB clear stands only if every DOB on file (vault and ID document) misses every listed DOB, the two agree, and every listed DOB could be read. A gender clear needs both genders and a DOB on file. A listed full DOB equal to any DOB on file always escalates. A hit with no review, or a review with no note, escalates.
+6. **Write.** `POST /users/{fp_id}/decisions` with `status: pass` and the notes as the annotation, only when every hit is cleared, every SDN entry Footprint's signal names was reviewed, and no other risk signal (document, PEP, adverse media) is open. Otherwise the review stays open and the analyst gets the brief. The receiver drops Svix retries it has already queued, and an error on one event leaves that case open instead of stopping the worker.
 
 ## Backtest before it touches a queue
 
@@ -33,6 +33,10 @@ FOOTPRINT_API_KEY=sk_test_... FOOTPRINT_WEBHOOK_SECRET=whsec_... ANTHROPIC_API_K
 ```
 
 then register `https://<host>/webhooks/footprint` in the Footprint dashboard.
+
+## What the backtest does and does not show
+
+The analysts' calls and the agent's instructions come from the same written procedure, so agreement shows that the agent and its guardrails follow a procedure, not how it would do on a bank's real history; that is what a pilot's backtest on the bank's own closed reviews is for. What the backtest does show is the gate working: the name-score cutoff wrongly cleared 2 listed people and was blocked. Candidate entries come from this repo's own screen of the SDN list; tying each review to Footprint's own match details is a pilot prerequisite, and until then a signal that does not name its entry keeps the customer with an analyst.
 
 ## Files
 
@@ -58,6 +62,6 @@ golive run evals/golive.yml             # the backtest, replaying the recorded C
 golive run evals/golive.baseline.yml    # the name-score cutoff: NO-GO
 ```
 
-The review step and the judge call Claude only in the **Record a live run** workflow (Actions tab, needs the `ANTHROPIC_API_KEY` secret), which writes every reply with its cost and latency to `recordings/`. CI and the demo replay those replies through the current code, so screening, guardrails and every Footprint request always run for real, with no key. A recording made with a different prompt, schema or model does not replay.
+The review step and the judge call Claude only in the **Record a live run** workflow (Actions tab, needs the `ANTHROPIC_API_KEY` secret), which writes every reply with its cost and latency to `recordings/`. CI and the demo replay those replies through the current code, so screening, the guardrails and every request to the Footprint stand-in run for real, with no key. A recording made with a different prompt, schema or model does not replay.
 
 List entries are real public data from OFAC. Customers, their records, the analysts' calls and the review procedure are constructed; no data here belongs to any bank or customer.
