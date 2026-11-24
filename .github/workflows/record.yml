@@ -78,4 +78,5 @@ jobs:
           git add recordings
           if [ -d docs ]; then git add docs; fi
           git commit -m "Record live run" || echo "nothing to commit"
+          git pull --rebase origin main
           git push

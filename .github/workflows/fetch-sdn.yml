@@ -1,11 +1,9 @@
 name: Refresh the OFAC SDN snapshot
 
 # Downloads the public SDN list into data/ofac/ and commits it.
+# Manual only: a new snapshot changes the hits, so the recorded Claude run must be re-recorded after it.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: [scripts/fetch_sdn.py]
 
 permissions:
   contents: write
@@ -23,6 +21,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # a new fetch time alone is not a new list
+          if git diff --quiet -- data/ofac/*.csv; then echo "list unchanged"; exit 0; fi
           git add data/ofac
           git commit -m "Refresh the OFAC SDN snapshot" || echo "nothing to commit"
           git push

@@ -1,0 +1,45 @@
+name: Commit a recording from an earlier run
+
+# If a "Record a live run" job recorded everything but could not push, this commits the recording
+# it uploaded (the live-run artifact) without calling Claude again.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID of the Record a live run workflow run"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-run
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: live-run
+      - name: Take the recording
+        run: |
+          ls -R live-run | head -20
+          cp live-run/recordings/*.jsonl recordings/
+          test "$(wc -l < recordings/reviewer.jsonl)" -eq 120
+      - name: Rebuild the demo page from it
+        run: python scripts/build_demo.py
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add recordings docs
+          git commit -m "Record live run (from run ${{ inputs.run_id }})" || echo "nothing to commit"
+          git pull --rebase origin main
+          git push
