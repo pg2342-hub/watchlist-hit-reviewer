@@ -1,0 +1,28 @@
+name: Refresh the OFAC SDN snapshot
+
+# Downloads the public SDN list into data/ofac/ and commits it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [scripts/fetch_sdn.py]
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/fetch_sdn.py
+      - name: Commit the snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ofac
+          git commit -m "Refresh the OFAC SDN snapshot" || echo "nothing to commit"
+          git push
